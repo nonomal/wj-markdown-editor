@@ -1,7 +1,7 @@
 {
   "name": "wj-markdown-editor",
   "type": "module",
-  "version": "2.11.0",
+  "version": "2.19.7",
   "description": "markdown编辑器",
   "author": {
     "name": "魏杰",
@@ -15,7 +15,9 @@
     "static": "electron .",
     "make": "cd ../wj-markdown-editor-web && npm install && npm run build && cd ../wj-markdown-editor-electron && npm install && electron-builder",
     "build": "electron-builder",
-    "lint": "eslint . --ext .vue,.js,.jsx,.cjs,.mjs --fix"
+    "lint": "eslint . --ext .vue,.js,.jsx,.cjs,.mjs --fix",
+    "test": "vitest",
+    "test:run": "vitest run"
   },
   "build": {
     "publish": {
@@ -91,6 +93,7 @@
     }
   },
   "dependencies": {
+    "ajv": "^8.18.0",
     "axios": "^1.13.2",
     "dayjs": "^1.11.13",
     "electron-log": "^5.3.4",
@@ -101,14 +104,16 @@
     "mime-types": "^3.0.1",
     "nanoid": "^5.1.5",
     "node-schedule": "^2.1.1",
-    "semver": "^7.7.1"
+    "semver": "^7.7.1",
+    "write-file-atomic": "^6.0.0"
   },
   "devDependencies": {
     "@antfu/eslint-config": "^4.11.0",
     "cross-env": "^7.0.3",
-    "electron": "^39.2.7",
+    "electron": "39.2.7",
     "electron-builder": "^26.0.12",
     "eslint": "^9.17.0",
-    "eslint-plugin-format": "^1.0.1"
+    "eslint-plugin-format": "^1.0.1",
+    "vitest": "^4.0.18"
   }
 }

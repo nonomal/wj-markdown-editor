@@ -1,11 +1,15 @@
-import router from '@/router/index.js'
-import channelUtil from '@/util/channel/channelUtil.js'
 import { ExclamationCircleOutlined } from '@ant-design/icons-vue'
 import { message, Modal, Tooltip } from 'ant-design-vue'
 import { nanoid } from 'nanoid'
 import { createVNode, h } from 'vue'
+import i18n from '@/i18n/index.js'
+import router from '@/router/index.js'
+import { requestRecentRemove } from '@/util/document-session/rendererDocumentCommandUtil.js'
+import { copyTextWithFeedback } from '@/util/previewInlineCodeCopyUtil.js'
+import { convertResourceUrl, stringToHex } from '@/util/resourceUrlUtil.js'
 
 const createId = () => `wj${nanoid()}`
+const { t } = i18n.global
 
 /**
  * 防抖函数
@@ -49,15 +53,14 @@ function getUrlParam(name) {
   return searchParams.get(name)
 }
 
-function stringToHex(str) {
-  let hex = ''
-  for (let i = 0; i < str.length; i++) {
-    const charCode = str.charCodeAt(i)
-    const hexValue = charCode.toString(16)
-    // 确保每个字符是两位十六进制表示
-    hex += hexValue.padStart(2, '0')
-  }
-  return hex
+/**
+ * 将 hex 解码为字符串
+ * @param {string} hex - hex 编码的字符串
+ * @returns {string} - 解码后的字符串
+ */
+function hexToString(hex) {
+  const bytes = new Uint8Array(hex.match(/.{1,2}/g).map(byte => Number.parseInt(byte, 16)))
+  return new TextDecoder().decode(bytes)
 }
 
 function upperCaseFirst(str) {
@@ -84,18 +87,24 @@ export default {
   strToBase64,
   base64ToStr,
   stringToHex,
+  convertResourceUrl,
+  hexToString,
   createId,
   getUrlParam,
   initCopyCode: () => {
     window.copyCode = (code) => {
-      if (!code) {
-        message.warning('没有可复制的内容')
-        return
-      }
-      navigator.clipboard.writeText(base64ToStr(code)).then(() => {
-        message.success('复制成功')
-      }).catch(() => {
-        message.error('复制失败')
+      copyTextWithFeedback({
+        text: code ? base64ToStr(code) : '',
+        writeText: async text => await navigator.clipboard.writeText(text),
+        onEmpty() {
+          message.warning(t('message.noCopyableContent'))
+        },
+        onSuccess() {
+          message.success(t('message.copySucceeded'))
+        },
+        onError() {
+          message.error(t('message.copyFailed'))
+        },
       })
     }
   },
@@ -131,7 +140,7 @@ export default {
             okText: '确认',
             cancelText: '取消',
             onOk: () => {
-              channelUtil.send({ event: 'recent-remove', data: path }).then(() => {})
+              requestRecentRemove(path).then(() => {})
             },
           })
         },
@@ -148,7 +157,7 @@ export default {
       okText: '确认',
       cancelText: '取消',
       onOk: () => {
-        channelUtil.send({ event: 'recent-remove', data: filePath }).then(() => {})
+        requestRecentRemove(filePath).then(() => {})
       },
     })
   },

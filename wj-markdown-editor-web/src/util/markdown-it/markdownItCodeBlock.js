@@ -1,11 +1,131 @@
-import commonUtil from '@/util/commonUtil.js'
 // @unocss-include
 import hljs from 'highlight.js'
+import { sha256 } from 'js-sha256'
+
+const COPY_CODE_LABEL = '复制'
+const canonicalLanguageKeyByAlias = createCanonicalLanguageKeyByAlias()
+
 /**
  * 若字符串以```结尾，则删除最后3个字符
  */
 function removeTripleBackticks(inputString) {
   return inputString.endsWith('```') ? inputString.slice(0, -3) : inputString
+}
+
+function strToBase64(str) {
+  const bytes = new TextEncoder().encode(str)
+  const binString = String.fromCodePoint(...bytes)
+  return btoa(binString)
+}
+
+/**
+ * 生成 Mermaid 代码块的缓存键。
+ * 仅用于 DOM 属性与缓存复用匹配，避免原始源码中的引号等字符破坏 HTML 属性。
+ * 使用同步 SHA-256 库，保持 markdown-it fence 渲染链路不变。
+ */
+function createMermaidCacheKey(content) {
+  return sha256(content.replace(/\s+/gu, ''))
+}
+
+function createCopyCodeKeydownHandler(encodedCode) {
+  return `if(event.key==='Enter'||event.key===' '){event.preventDefault();copyCode('${encodedCode}')}`
+}
+
+/**
+ * 生成 highlight.js 语言别名到 canonical key 的映射
+ */
+function createCanonicalLanguageKeyByAlias() {
+  const aliasMap = new Map()
+
+  hljs.listLanguages().forEach((languageKey) => {
+    const language = hljs.getLanguage(languageKey)
+    if (!language) {
+      return
+    }
+
+    aliasMap.set(languageKey.toLowerCase(), languageKey)
+    if (Array.isArray(language.aliases)) {
+      language.aliases.forEach((alias) => {
+        aliasMap.set(String(alias).toLowerCase(), languageKey)
+      })
+    }
+  })
+
+  return aliasMap
+}
+
+/**
+ * 解析普通 fenced code block 的语言元数据
+ */
+function resolveCodeBlockLanguageMeta(info, code) {
+  const explicitLabel = info ? info.split(/\s+/u)[0]?.trim() ?? '' : ''
+
+  if (explicitLabel) {
+    const normalizedInput = explicitLabel.toLowerCase()
+    const canonicalKey = canonicalLanguageKeyByAlias.get(normalizedInput) ?? ''
+    const codeClassNames = ['hljs']
+
+    if (canonicalKey) {
+      codeClassNames.push(`language-${normalizedInput}`)
+      if (canonicalKey !== normalizedInput) {
+        codeClassNames.push(`language-${canonicalKey}`)
+      }
+    }
+
+    return {
+      codeClassName: codeClassNames.join(' '),
+      highlightedValue: canonicalKey
+        ? hljs.highlight(code, { language: canonicalKey, ignoreIllegals: true }).value
+        : hljs.highlightAuto(code).value,
+      toolbarLangLabel: explicitLabel,
+      toolbarLangHidden: false,
+    }
+  }
+
+  const autoHighlightResult = hljs.highlightAuto(code)
+  const codeClassNames = ['hljs']
+
+  if (autoHighlightResult.language) {
+    codeClassNames.push(`language-${autoHighlightResult.language}`)
+  }
+
+  return {
+    codeClassName: codeClassNames.join(' '),
+    highlightedValue: autoHighlightResult.value,
+    toolbarLangLabel: '',
+    toolbarLangHidden: true,
+  }
+}
+
+function createFallbackCodeBlockLanguageMeta(info, code, md) {
+  const explicitLabel = info ? info.split(/\s+/u)[0]?.trim() ?? '' : ''
+
+  if (explicitLabel) {
+    const normalizedInput = explicitLabel.toLowerCase()
+    const canonicalKey = canonicalLanguageKeyByAlias.get(normalizedInput) ?? ''
+    const codeClassNames = ['hljs']
+
+    if (canonicalKey) {
+      codeClassNames.push(`language-${normalizedInput}`)
+      if (canonicalKey !== normalizedInput) {
+        codeClassNames.push(`language-${canonicalKey}`)
+      }
+    }
+
+    return {
+      codeClassName: codeClassNames.join(' '),
+      highlightedValue: md.utils.escapeHtml(code),
+      toolbarLangLabel: explicitLabel,
+      toolbarLangHidden: false,
+    }
+  }
+
+  return {
+    codeClassName: 'hljs',
+    highlightedValue: md.utils.escapeHtml(code),
+    toolbarLangLabel: '',
+    toolbarLangHidden: true,
+  }
 }
 
 function parseAttrs(attrs) {
@@ -41,37 +161,45 @@ function html(strings, ...values) {
     .trim() // 去除首尾的空白
 }
 
+function renderStandardCodeBlockHtml(token, encodedCode, languageMeta, md) {
+  const preAttrs = parseAttrs(token.attrs)
+  const escapedToolbarLabel = md.utils.escapeHtml(languageMeta.toolbarLangLabel)
+
+  return html`
+  <div class="pre-container">
+    <div class="pre-container-toolbar">
+      <div class="pre-container-action-slot">
+        <div class="pre-container-lang ${languageMeta.toolbarLangHidden ? 'hidden' : ''}">${escapedToolbarLabel}</div>
+        <div class="i-tabler:copy pre-container-copy" role="button" tabindex="0" title="${COPY_CODE_LABEL}" aria-label="${COPY_CODE_LABEL}" onclick="copyCode('${encodedCode}')" onkeydown="${createCopyCodeKeydownHandler(encodedCode)}"></div>
+      </div>
+    </div>
+    <pre${preAttrs ? ` ${preAttrs}` : ''}>
+      <code class="${languageMeta.codeClassName}">`
+      + languageMeta.highlightedValue
+      + html`</code>
+    </pre>
+  </div>
+  `
+}
+
 export default function codeBlockPlugin(md) {
-  const defaultRenderer = md.renderer.rules.fence.bind(md.renderer.rules)
-  md.renderer.rules.fence = (tokens, idx, options, env, slf) => {
+  md.renderer.rules.fence = (tokens, idx) => {
     const token = tokens[idx]
     const code = token.content.trim()
     const info = token.info ? md.utils.unescapeAll(token.info).trim() : ''
     const lang = info.split(/\s+/g)[0]
+    const encodedCode = strToBase64(code)
     if (lang === 'mermaid') {
       const content = removeTripleBackticks(code)
-      return `<pre class="mermaid" data-code="${content.replace(/\s/g, '')}" ${parseAttrs(token.attrs)}>\n${content}\n</pre>\n`
+      return `<pre class="mermaid" data-code="${createMermaidCacheKey(content)}" ${parseAttrs(token.attrs)}>\n${content}\n</pre>\n`
     } else {
       try {
-        return html`
-        <div class="relative pre-container">
-          <div class="absolute top-0 right-0 p-1 z-10">
-            <div class="font-bold op-80 color-[var(--wj-markdown-text-secondary)] pre-container-lang font-size-3 line-height-3">${lang}</div>
-            <div class="i-tabler:copy cursor-pointer op-80 color-[var(--wj-markdown-text-secondary)] pre-container-copy hidden font-size-3.5 hover:op-100" title="复制" onclick="copyCode('${commonUtil.strToBase64(code)}')"></div>
-          </div>
-          <pre class="hljs" ${parseAttrs(token.attrs)}>
-            <code>`
-          + (lang && hljs.getLanguage(lang)
-            ? hljs.highlight(code, { language: lang, ignoreIllegals: true }).value
-            : hljs.highlightAuto(code).value)
-          + html`</code>
-          </pre>
-        </div>
-        `
+        const languageMeta = resolveCodeBlockLanguageMeta(info, code)
+        return renderStandardCodeBlockHtml(token, encodedCode, languageMeta, md)
       } catch (e) {
         console.error(e)
+        return renderStandardCodeBlockHtml(token, encodedCode, createFallbackCodeBlockLanguageMeta(info, code, md), md)
       }
     }
-    return defaultRenderer(tokens, idx, options, env, slf)
   }
 }

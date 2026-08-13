@@ -1,18 +1,66 @@
 <script setup>
-import { useCommonStore } from '@/stores/counter.js'
-import channelUtil from '@/util/channel/channelUtil.js'
-import commonUtil from '@/util/commonUtil.js'
-import shortcutKeyUtil from '@/util/shortcutKeyUtil.js'
 import { ExclamationCircleOutlined } from '@ant-design/icons-vue'
 import { Modal, Tooltip } from 'ant-design-vue'
 import { createVNode, h, onBeforeMount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { useCommonStore } from '@/stores/counter.js'
+import channelUtil from '@/util/channel/channelUtil.js'
+import commonUtil from '@/util/commonUtil.js'
+import {
+  requestDocumentOpenByDialogAndOpen,
+  requestDocumentOpenPathByInteraction,
+} from '@/util/document-session/documentOpenInteractionService.js'
+import {
+  isDocumentOpenMissingResult,
+  requestRecentClear,
+} from '@/util/document-session/rendererDocumentCommandUtil.js'
+import toggleFullScreenAction from '@/util/fullScreenActionUtil.js'
+import shortcutKeyUtil from '@/util/shortcutKeyUtil.js'
 
 const { t } = useI18n()
+const store = useCommonStore()
 
 const menuList = ref([])
-const shortcutKeyList = ref(useCommonStore().config.shortcutKeyList)
-const recentList = ref(useCommonStore().recentList)
+const shortcutKeyList = ref(store.config.shortcutKeyList)
+const recentList = ref(store.recentList)
+const isFullScreen = ref(store.isFullScreen)
+const fileManagerPanelVisible = ref(store.fileManagerPanelVisible)
+
+function joinMenuLabel(segmentList) {
+  const compactLocale = String(store.config.language || '').toLowerCase().startsWith('zh')
+  return segmentList.filter(Boolean).join(compactLocale ? '' : ' ')
+}
+
+function getFileManagerToggleLabel() {
+  const labelKey = fileManagerPanelVisible.value
+    ? 'topMenu.view.children.hideFileManager'
+    : 'topMenu.view.children.showFileManager'
+  const translatedLabel = t(labelKey)
+
+  if (translatedLabel !== labelKey) {
+    return translatedLabel
+  }
+
+  return joinMenuLabel([
+    t(fileManagerPanelVisible.value ? 'config.disable' : 'config.enable'),
+    t('config.view.defaultShowFileManager'),
+  ])
+}
+
+function createMenuLabel(label, shortcutKeyId) {
+  const keymap = getKeymapByShortcutKeyId(shortcutKeyId)
+  return keymap ? commonUtil.createLabel(label, keymap) : label
+}
+
+function sendExportStart(type, target) {
+  channelUtil.send({
+    event: 'export-start',
+    data: {
+      type,
+      target,
+    },
+  })
+}
 
 function createRecentListVNode() {
   return recentList.value.map((item) => {
@@ -20,8 +68,11 @@ function createRecentListVNode() {
       key: commonUtil.createId(),
       label: commonUtil.createRecentLabel(item.path, item.name),
       click: () => {
-        channelUtil.send({ event: 'open-file', data: item.path }).then((exists) => {
-          if (exists === false) {
+        requestDocumentOpenPathByInteraction(item.path, {
+          entrySource: 'recent',
+          trigger: 'user',
+        }).then((result) => {
+          if (isDocumentOpenMissingResult(result)) {
             commonUtil.recentFileNotExists(item.path)
           }
         })
@@ -58,7 +109,7 @@ function updateMenuList() {
           okText: t('config.yes'),
           cancelText: t('config.no'),
           onOk: () => {
-            channelUtil.send({ event: 'recent-clear' })
+            requestRecentClear().then(() => {})
           },
         })
       },
@@ -71,7 +122,7 @@ function updateMenuList() {
       children: [
         {
           key: commonUtil.createId(),
-          label: commonUtil.createLabel(t('topMenu.file.children.createNew'), getKeymapByShortcutKeyId('createNew')),
+          label: createMenuLabel(t('topMenu.file.children.createNew'), 'createNew'),
           click: () => {
             shortcutKeyUtil.getWebShortcutKeyHandler('createNew', true)
           },
@@ -83,21 +134,24 @@ function updateMenuList() {
         },
         {
           key: commonUtil.createId(),
-          label: commonUtil.createLabel(t('topMenu.file.children.openFile'), getKeymapByShortcutKeyId('openFile')),
+          label: createMenuLabel(t('topMenu.file.children.openFile'), 'openFile'),
           click: () => {
-            shortcutKeyUtil.getWebShortcutKeyHandler('openFile', true)
+            requestDocumentOpenByDialogAndOpen({
+              entrySource: 'menu-open',
+              trigger: 'user',
+            }).then(() => {})
           },
         },
         {
           key: commonUtil.createId(),
-          label: commonUtil.createLabel(t('topMenu.file.children.saveFile'), getKeymapByShortcutKeyId('save')),
+          label: createMenuLabel(t('topMenu.file.children.saveFile'), 'save'),
           click: () => {
             shortcutKeyUtil.getWebShortcutKeyHandler('save', true)
           },
         },
         {
           key: commonUtil.createId(),
-          label: commonUtil.createLabel(t('topMenu.file.children.saveFileAs'), getKeymapByShortcutKeyId('saveOther')),
+          label: createMenuLabel(t('topMenu.file.children.saveFileAs'), 'saveOther'),
           click: () => {
             shortcutKeyUtil.getWebShortcutKeyHandler('saveOther', true)
           },
@@ -108,24 +162,40 @@ function updateMenuList() {
         },
         {
           key: commonUtil.createId(),
-          label: t('topMenu.file.children.export.name'),
+          label: t('topMenu.file.children.export.exportToFile'),
           children: [
             {
               key: commonUtil.createId(),
               label: h(Tooltip, { 'title': t('topMenu.file.children.export.pdfTip'), 'auto-adjust-overflow': true, 'placement': 'right', 'color': '#1677ff' }, () => [
                 h('div', {}, 'PDF'),
               ]),
-              click: () => { channelUtil.send({ event: 'export-start', data: 'PDF' }) },
+              click: () => { sendExportStart('PDF', 'file') },
             },
             {
               key: commonUtil.createId(),
               label: 'PNG',
-              click: () => { channelUtil.send({ event: 'export-start', data: 'PNG' }) },
+              click: () => { sendExportStart('PNG', 'file') },
             },
             {
               key: commonUtil.createId(),
               label: 'JPEG',
-              click: () => { channelUtil.send({ event: 'export-start', data: 'JPEG' }) },
+              click: () => { sendExportStart('JPEG', 'file') },
+            },
+          ],
+        },
+        {
+          key: commonUtil.createId(),
+          label: t('topMenu.file.children.export.exportToClipboard'),
+          children: [
+            {
+              key: commonUtil.createId(),
+              label: 'PNG',
+              click: () => { sendExportStart('PNG', 'clipboard') },
+            },
+            {
+              key: commonUtil.createId(),
+              label: 'JPEG',
+              click: () => { sendExportStart('JPEG', 'clipboard') },
             },
           ],
         },
@@ -135,7 +205,7 @@ function updateMenuList() {
         },
         {
           key: commonUtil.createId(),
-          label: commonUtil.createLabel(t('topMenu.file.children.setting'), getKeymapByShortcutKeyId('setting')),
+          label: createMenuLabel(t('topMenu.file.children.setting'), 'setting'),
           click: () => {
             shortcutKeyUtil.getWebShortcutKeyHandler('setting', true)
           },
@@ -147,9 +217,29 @@ function updateMenuList() {
       label: t('topMenu.view.name'),
       children: [
         {
-          label: commonUtil.createLabel(t('topMenu.view.children.switchView'), getKeymapByShortcutKeyId('switchView')),
+          key: commonUtil.createId(),
+          label: createMenuLabel(t('topMenu.view.children.switchView'), 'switchView'),
           click: () => {
             shortcutKeyUtil.getWebShortcutKeyHandler('switchView', true)
+          },
+        },
+        {
+          key: commonUtil.createId(),
+          label: createMenuLabel(t(isFullScreen.value ? 'topMenu.view.children.exitFullScreen' : 'topMenu.view.children.enterFullScreen'), 'toggleFullScreen'),
+          click: () => {
+            toggleFullScreenAction()
+          },
+        },
+        {
+          key: commonUtil.createId(),
+          label: createMenuLabel(getFileManagerToggleLabel(), 'toggleFileManagerPanel'),
+          click: () => {
+            if (typeof store.setFileManagerPanelVisible === 'function') {
+              store.setFileManagerPanelVisible(!store.fileManagerPanelVisible)
+              return
+            }
+
+            store.fileManagerPanelVisible = !store.fileManagerPanelVisible
           },
         },
       ],
@@ -175,18 +265,26 @@ function updateMenuList() {
   ]
 }
 
-watch(() => useCommonStore().config.language, () => {
+watch(() => store.config.language, () => {
   updateMenuList()
 }, { immediate: true })
 
-watch(() => useCommonStore().config.shortcutKeyList, (newValue) => {
+watch(() => store.config.shortcutKeyList, (newValue) => {
   shortcutKeyList.value = newValue
   updateMenuList()
 }, { deep: true })
-watch(() => useCommonStore().recentList, (newValue) => {
+watch(() => store.recentList, (newValue) => {
   recentList.value = newValue
   updateMenuList()
 }, { deep: true })
+watch(() => store.isFullScreen, (newValue) => {
+  isFullScreen.value = newValue
+  updateMenuList()
+})
+watch(() => store.fileManagerPanelVisible, (newValue) => {
+  fileManagerPanelVisible.value = newValue
+  updateMenuList()
+})
 
 function getKeymapByShortcutKeyId(id) {
   const shortcutKey = shortcutKeyList.value.find(item => item.id === id && item.enabled === true)

@@ -1,8 +1,20 @@
 <script setup>
+import { message } from 'ant-design-vue'
+import { computed, onBeforeMount, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
 import log from '@/assets/img/logo.png'
 import { useCommonStore } from '@/stores/counter.js'
 import channelUtil from '@/util/channel/channelUtil.js'
-import { computed, onBeforeMount, ref } from 'vue'
+import {
+  createSetConfigPathRequest,
+  sendConfigMutationRequest,
+} from '@/util/config/configMutationCommandUtil.js'
+import { getConfigUpdateFailureMessageKey } from '@/util/config/configUpdateResultUtil.js'
+import shortcutKeyUtil from '@/util/shortcutKeyUtil.js'
+import { createLayoutTopOpenFolderAction } from './layoutTopOpenFolderAction.js'
+
+const store = useCommonStore()
+const { t } = useI18n()
 
 function minimize() {
   channelUtil.send({ event: 'minimize' })
@@ -16,31 +28,66 @@ function restore() {
 function close() {
   channelUtil.send({ event: 'close' })
 }
-function openFolder() {
-  channelUtil.send({ event: 'open-folder' })
-}
+const openFolder = createLayoutTopOpenFolderAction({
+  sendCommand: payload => channelUtil.send(payload),
+  notifyDocumentNotSaved: () => {
+    message.warning(t('message.theCurrentFileIsNotSaved'))
+  },
+})
 
 function openAbout() {
   channelUtil.send({ event: 'open-about' })
 }
 
-const fileName = computed(() => useCommonStore().fileName)
-const saved = computed(() => useCommonStore().saved)
-const isMaximize = computed(() => useCommonStore().isMaximize)
-const isAlwaysOnTop = computed(() => useCommonStore().isAlwaysOnTop)
-const theme = computed(() => useCommonStore().config.theme.global)
+function switchView() {
+  shortcutKeyUtil.getWebShortcutKeyHandler('switchView', true)
+}
+
+const fileName = computed(() => store.fileName)
+const saved = computed(() => store.saved)
+const isMaximize = computed(() => store.isMaximize)
+const isAlwaysOnTop = computed(() => store.isAlwaysOnTop)
+const theme = computed(() => store.config.theme.global)
 
 function alwaysOnTop(flag) {
   channelUtil.send({ event: 'always-on-top', data: flag })
 }
 
-function switchThemes() {
-  channelUtil.send({ event: 'user-update-theme-global', data: theme.value === 'light' ? 'dark' : 'light' })
+async function switchThemes() {
+  try {
+    const result = await sendConfigMutationRequest(
+      createSetConfigPathRequest(['theme', 'global'], theme.value === 'light' ? 'dark' : 'light'),
+    )
+    const messageKey = getConfigUpdateFailureMessageKey(result)
+    if (messageKey) {
+      message.warning(t(messageKey))
+    }
+  }
+  catch {
+    message.warning(t('message.configWriteFailed'))
+  }
+}
+
+const language = computed(() => store.config.language)
+
+async function switchLanguage(lang) {
+  try {
+    const result = await sendConfigMutationRequest(
+      createSetConfigPathRequest(['language'], lang),
+    )
+    const messageKey = getConfigUpdateFailureMessageKey(result)
+    if (messageKey) {
+      message.warning(t(messageKey))
+    }
+  }
+  catch {
+    message.warning(t('message.configWriteFailed'))
+  }
 }
 
 const appInfo = ref({ name: 'wj-markdown-editor', version: '' })
 
-const hasNewVersion = computed(() => useCommonStore().hasNewVersion)
+const hasNewVersion = computed(() => store.hasNewVersion)
 
 onBeforeMount(async () => {
   const info = await channelUtil.send({ event: 'app-info' })
@@ -65,6 +112,18 @@ onBeforeMount(async () => {
       <span v-if="!saved" class="color-red">*</span>
     </div>
     <div class="flex items-center">
+      <a-tooltip placement="bottom" color="#1677ff">
+        <template #title>
+          <span>{{ $t('top.switchView') }}</span>
+        </template>
+        <div
+          data-testid="layout-top-switch-view"
+          class="h-8 w-8 flex items-center justify-center hover:cursor-pointer hover:bg-bg-hover"
+          @click="switchView"
+        >
+          <div class="i-tabler:arrows-left-right" />
+        </div>
+      </a-tooltip>
       <a-tooltip v-if="hasNewVersion" placement="bottom" color="#1677ff">
         <template #title>
           <span>{{ $t('top.newVersion') }}</span>
@@ -82,6 +141,23 @@ onBeforeMount(async () => {
           <div v-else class="i-tabler:sun" />
         </div>
       </a-tooltip>
+      <a-dropdown placement="bottom" :trigger="['hover', 'click']" arrow>
+        <div class="h-8 w-8 flex items-center justify-center hover:cursor-pointer hover:bg-bg-hover">
+          <div class="i-tabler:language" />
+        </div>
+        <template #overlay>
+          <a-menu>
+            <a-menu-item key="zh-CN" @click="switchLanguage('zh-CN')">
+              <span v-if="language === 'zh-CN'" class="i-tabler:check mr-1" />
+              <span v-else class="mr-4" />中文
+            </a-menu-item>
+            <a-menu-item key="en-US" @click="switchLanguage('en-US')">
+              <span v-if="language === 'en-US'" class="i-tabler:check mr-1" />
+              <span v-else class="mr-4" />English
+            </a-menu-item>
+          </a-menu>
+        </template>
+      </a-dropdown>
       <a-tooltip placement="bottom" color="#1677ff">
         <template #title>
           <span>{{ $t('top.openInExplorer') }}</span>

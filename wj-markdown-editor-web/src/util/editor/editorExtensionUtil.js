@@ -1,4 +1,3 @@
-import completionHandler from '@/util/editor/completion/completionHandler.js'
 import {
   autocompletion,
   closeBrackets,
@@ -18,12 +17,13 @@ import {
   crosshairCursor,
   drawSelection,
   dropCursor,
+  EditorView,
   highlightActiveLine,
   highlightSpecialChars,
   lineNumbers,
   rectangularSelection,
 } from '@codemirror/view'
-import { EditorView } from 'codemirror'
+import completionHandler from '@/util/editor/completion/completionHandler.js'
 
 /**
  * 固定的插件
@@ -33,7 +33,10 @@ const fixedExtension = [
   drawSelection(),
   dropCursor(),
   indentOnInput(),
-  search(),
+  search({
+    // 显式使用当前编辑器实例的 EditorView 生成滚动效果，保证搜索命令既更新选区，也触发可预期的滚动定位。
+    scrollToMatch: (range, _view) => EditorView.scrollIntoView(range, { y: 'center' }),
+  }),
   markdown({ codeLanguages: languages }),
   EditorView.theme({
     '&': {
@@ -41,13 +44,19 @@ const fixedExtension = [
       fontSize: '1rem',
     },
     '.cm-line': {
-      fontFamily: 'source-code-pro,Menlo,Monaco,Consolas,Courier New,monospace', // 字体
+      fontFamily: 'var(--edit-area-font)', // 字体
+    },
+    '.cm-completionLabel': {
+      fontFamily: 'var(--edit-area-font)', // 字体
     },
     '.cm-content': {
       lineHeight: '1.5',
+      paddingBottom: 'var(--wj-editor-bottom-gap, 40vh)',
     },
     '.cm-gutterElement': {
       userSelect: 'none',
+      padding: '0 !important',
+      textAlign: 'center !important',
     },
     '.cm-scroller': {
       overflowY: 'scroll',
@@ -56,29 +65,6 @@ const fixedExtension = [
     '.cm-panels:has(.cm-search.cm-panel)': {
       height: 0,
       overflow: 'hidden',
-    },
-    '*::-webkit-scrollbar': {
-      display: 'revert',
-      width: '6px',
-      height: '6px',
-    },
-    /* 滚动条里面轨道 */
-    '*::-webkit-scrollbar-track': {
-      backgroundColor: 'var(--wj-markdown-scroll-bg)',
-    },
-    '*::-webkit-scrollbar-corner': {
-      backgroundColor: 'var(--wj-markdown-scroll-bg)',
-    },
-    /* 滚动条的样式 */
-    '*::-webkit-scrollbar-thumb': {
-      borderRadius: '4px',
-      backgroundColor: '#0000004d',
-    },
-    '*::-webkit-scrollbar-thumb:hover': {
-      backgroundColor: '#00000059',
-    },
-    '*::-webkit-scrollbar-thumb:active': {
-      backgroundColor: '#00000061',
     },
   }),
   autocompletion({

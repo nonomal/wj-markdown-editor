@@ -1,6 +1,6 @@
 <script setup>
+import { computed, isVNode } from 'vue'
 import CommonVNode from '@/components/CommonVNode.vue'
-import { isVNode } from 'vue'
 
 const props = defineProps({
   label: {
@@ -20,6 +20,16 @@ const props = defineProps({
     required: false,
     default: () => [],
   },
+  menuTrigger: {
+    type: Array,
+    required: false,
+    default: () => ['hover'],
+  },
+  menuSelectedKeys: {
+    type: Array,
+    required: false,
+    default: () => [],
+  },
   action: {
     type: Function,
     required: false,
@@ -30,8 +40,24 @@ const props = defineProps({
   },
 })
 
-function handleMenuClick({ item }) {
-  item.originItemValue.action && item.originItemValue.action()
+const resolvedMenuList = computed(() => {
+  return (props.menuList || []).map((item, index) => ({
+    ...item,
+    key: item?.key ?? String(index),
+  }))
+})
+
+function resolveMenuAction(menuInfo) {
+  const matchedMenuItem = resolvedMenuList.value.find(item => String(item?.key) === String(menuInfo?.key))
+
+  return matchedMenuItem?.action || menuInfo?.item?.originItemValue?.action || null
+}
+
+function handleMenuClick(menuInfo) {
+  const action = resolveMenuAction(menuInfo)
+  if (typeof action === 'function') {
+    action()
+  }
 }
 </script>
 
@@ -59,7 +85,7 @@ function handleMenuClick({ item }) {
   </a-popover>
   <a-dropdown
     v-else-if="menuList && menuList.length > 0"
-    :trigger="['hover']"
+    :trigger="menuTrigger"
     class="select-none"
     arrow
     placement="bottom"
@@ -83,7 +109,8 @@ function handleMenuClick({ item }) {
     <template #overlay>
       <a-menu
         mode="vertical"
-        :items="menuList"
+        :items="resolvedMenuList"
+        :selected-keys="menuSelectedKeys"
         @click="handleMenuClick"
       />
     </template>

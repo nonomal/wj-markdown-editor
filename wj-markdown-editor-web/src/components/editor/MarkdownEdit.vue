@@ -1,29 +1,68 @@
 <script setup>
+import Split from 'split-grid'
+import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
+import {
+  createMarkdownEditPreviewScrollAnchorRestore,
+  createMarkdownEditScrollAnchorCapture,
+} from '@/components/editor/composables/markdownEditScrollAnchorCaptureUtil.js'
+import { isPointerSelectionUpdate } from '@/components/editor/composables/selectionUpdateUtil.js'
+import { useAssetInsert } from '@/components/editor/composables/useAssetInsert.js'
+import { useAssociationHighlight } from '@/components/editor/composables/useAssociationHighlight.js'
+import { useEditorCore } from '@/components/editor/composables/useEditorCore.js'
+import { usePreviewSync } from '@/components/editor/composables/usePreviewSync.js'
+import { useToolbarBuilder } from '@/components/editor/composables/useToolbarBuilder.js'
+import { useViewScrollAnchor } from '@/components/editor/composables/useViewScrollAnchor.js'
 import EditorSearchBar from '@/components/editor/EditorSearchBar.vue'
-import IconButton from '@/components/editor/IconButton.vue'
+import EditorToolbar from '@/components/editor/EditorToolbar.vue'
+import ImageNetworkModal from '@/components/editor/ImageNetworkModal.vue'
+import { resolveAdaptiveGridTemplateColumns } from '@/components/editor/markdownEditGridTemplateColumnsUtil.js'
+import {
+  resolveMarkdownEditLayoutMode,
+  resolveMarkdownEditSplitColumnGutters,
+} from '@/components/editor/markdownEditLayoutMode.js'
+import { createMarkdownEditPreviewLayoutIndexWiring } from '@/components/editor/markdownEditPreviewLayoutIndexWiring.js'
+import { resolveMarkdownEditRenderItems } from '@/components/editor/markdownEditRenderItems.js'
 import MarkdownMenu from '@/components/editor/MarkdownMenu.vue'
 import MarkdownPreview from '@/components/editor/MarkdownPreview.vue'
-import TableShape from '@/components/TableShape.vue'
+import { createPreviewRefreshCoordinator } from '@/components/editor/previewRefreshCoordinator.js'
 import { useCommonStore } from '@/stores/counter.js'
-import channelUtil from '@/util/channel/channelUtil.js'
-import commonUtil from '@/util/commonUtil.js'
-import editorExtensionUtil from '@/util/editor/editorExtensionUtil.js'
-import editorUtil from '@/util/editor/editorUtil.js'
+import {
+  shouldDeferExternalEditorDispatch,
+} from '@/util/editor/compositionStateUtil.js'
+import {
+  resolvePendingContentUpdateMeta,
+  shouldDeferStaleContentSync,
+} from '@/util/editor/contentUpdateMetaUtil.js'
+import { createFlushableDebounce } from '@/util/editor/flushableDebounceUtil.js'
 import keymapUtil from '@/util/editor/keymap/keymapUtil.js'
-import { Compartment } from '@codemirror/state'
-import { oneDark } from '@codemirror/theme-one-dark'
-import { keymap } from '@codemirror/view'
-import { Form, message } from 'ant-design-vue'
-import { EditorView } from 'codemirror'
-import Split from 'split-grid'
-import { computed, createVNode, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { ColorPicker } from 'vue3-colorpicker'
-import { useI18n } from 'vue-i18n'
+import {
+  captureEditorLineAnchor,
+  capturePreviewLineAnchor,
+  resolveEditorLineAnchorScrollTop,
+  resolvePreviewLineAnchorScrollTop,
+} from '@/util/editor/viewScrollAnchorMathUtil.js'
+import {
+  createViewScrollAnchorSessionStore,
+} from '@/util/editor/viewScrollAnchorSessionUtil.js'
+import { previewSearchBarController } from '@/util/searchBarController.js'
+import { closeSearchBarIfVisible } from '@/util/searchBarLifecycleUtil.js'
+import { createSearchTargetBridge } from '@/util/searchTargetBridgeUtil.js'
+import { collectSearchTargetElements } from '@/util/searchTargetUtil.js'
 
 const props = defineProps({
   modelValue: {
     type: String,
     default: () => '',
+  },
+  contentUpdateMeta: {
+    type: Object,
+    default: () => ({
+      token: 0,
+      cursorPosition: null,
+      focus: false,
+      scrollIntoView: false,
+    }),
   },
   theme: {
     type: String,
@@ -35,7 +74,7 @@ const props = defineProps({
   },
   previewTheme: {
     type: String,
-    default: () => 'github-light',
+    default: () => 'github',
   },
   watermark: {
     type: Object,
@@ -45,41 +84,35 @@ const props = defineProps({
     type: Object,
     default: () => undefined,
   },
+  associationHighlight: {
+    type: Boolean,
+    default: false,
+  },
+  previewPosition: {
+    type: String,
+    default: () => 'right',
+  },
 })
 
-const emits = defineEmits(['update:modelValue', 'upload', 'save', 'anchorChange', 'imageContextmenu'])
+const emits = defineEmits(['update:modelValue', 'upload', 'save', 'anchorChange', 'previewContextmenu', 'assetOpen'])
 
 const { t } = useI18n()
+const store = useCommonStore()
 
 const toolbarList = ref([])
 const shortcutKeyList = ref([])
 let splitInstance
-const editorSearchBarVisible = computed(() => useCommonStore().editorSearchBarVisible)
-const dynamicExtension = editorExtensionUtil.getDynamicExtension()
+let splitGutterSyncElements = []
 
-function onEditorSearchBarClose() {
-  useCommonStore().editorSearchBarVisible = false
-}
-
-const useForm = Form.useForm
-
-const imageNetworkModel = ref(false)
-const imageNetworkData = reactive({ name: undefined, url: undefined })
-const imageNetworkDataRules = reactive({
-  url: [{ required: true, message: '请输入链接' }, { pattern: /^https?:\/\/.+/, message: '链接不正确' }],
-})
-
-const { validate } = useForm(imageNetworkData, imageNetworkDataRules)
+const editorSearchBarVisible = computed(() => store.editorSearchBarVisible)
+const associationHighlightEnabled = computed(() => props.associationHighlight === true)
+const themeRef = computed(() => store.config.theme.global)
 
 const gutterRef = ref()
 const gutterMenuRef = ref()
-let editorView
 const editorRef = ref()
 const previewRef = ref()
-const isComposing = ref(false)
 const scrolling = ref({ editor: false, preview: false })
-const keymapCompartment = new Compartment()
-const themeCompartment = new Compartment()
 const editorContainer = ref()
 const anchorList = ref([])
 const editorScrollTop = ref(0)
@@ -87,450 +120,467 @@ const menuVisible = ref(false)
 const menuController = ref(false)
 const previewVisible = ref(true)
 const previewController = ref(true)
-const gridAnimation = ref(false)
+// 仅在预览从“未渲染”重新挂载为“已渲染”时，延后首轮同步到 refreshComplete。
+const pendingPreviewResyncAfterRefresh = ref(false)
+const layoutMode = computed(() => resolveMarkdownEditLayoutMode({
+  previewVisible: previewVisible.value,
+  menuVisible: menuVisible.value,
+  previewPosition: props.previewPosition,
+}))
+const handledContentUpdateToken = ref(0)
+// 当前滚动锚点只跟随最近一次对外确认过的 session snapshot。
+// 这样 capture / restore 都会严格绑定到外层给定的 sessionId + revision。
+const currentScrollSnapshot = ref({
+  sessionId: '',
+  revision: 0,
+})
+// 恢复期间需要临时冻结左右联动滚动，避免恢复过程被同步逻辑反向覆盖。
+const restoreState = ref({
+  active: false,
+  editorCode: false,
+  editorPreview: false,
+})
+// 记录编辑器最近一次已经向上游暴露的正文，用于识别滞后的 snapshot echo。
+const lastExposedContent = ref(props.modelValue)
+const pendingExternalSync = ref(null)
+// 仅在当前 keep-alive 编辑页实例内存活的滚动锚点缓存。
+// 不做全局单例，避免不同编辑页实例之间互相污染。
+const viewScrollAnchorStore = createViewScrollAnchorSessionStore()
 
-watch(() => props.theme, (newValue) => {
-  if (newValue === 'dark') {
-    editorView.dispatch({
-      effects: themeCompartment.reconfigure([oneDark]),
-    })
-  } else {
-    editorView.dispatch({
-      effects: themeCompartment.reconfigure([]),
-    })
-  }
+const BOTTOM_GAP = '40vh'
+const EDITOR_EMIT_DEBOUNCE_MS = 160
+let viewRestoreRequestToken = 0
+
+function getPreviewSearchTargetElements() {
+  return collectSearchTargetElements(editorContainer.value)
+}
+const previewSearchTargetBridge = createSearchTargetBridge({
+  controller: previewSearchBarController,
+  getTargetElements: () => getPreviewSearchTargetElements(),
 })
 
-watch(() => props.extension, (newValue) => {
-  for (const key in dynamicExtension) {
-    if (!newValue || newValue[key] !== false) {
-      editorView.dispatch({
-        effects: dynamicExtension[key].compartment.reconfigure(dynamicExtension[key].extension),
-      })
-    } else {
-      editorView.dispatch({
-        effects: dynamicExtension[key].compartment.reconfigure([]),
-      })
-    }
-  }
-}, { deep: true })
+function onEditorSearchBarClose() {
+  store.editorSearchBarVisible = false
+}
 
-function insertImageToEditor(imageInfo) {
-  if (imageInfo) {
-    const to = editorView.state.selection.main.to
-    // 如果当前行不为空的话，则需要使用换行符
-    let wrap = false
-    const line = editorView.state.doc.lineAt(to)
-    if (line.from !== line.to) {
-      wrap = true
-    }
-    const insert = `${wrap === true ? '\n' : ''}![${imageInfo.name}](<${imageInfo.path}>)`
+function closePreviewSearchBar() {
+  closeSearchBarIfVisible({
+    controller: previewSearchBarController,
+    store,
+  })
+}
 
-    editorView.dispatch({
-      changes: {
-        from: to,
-        to,
-        insert,
-      },
-      selection: { anchor: to + insert.length },
-    })
+const {
+  editorView,
+  isCompositionActive,
+  initEditor,
+  destroyEditor,
+  reconfigureTheme,
+  reconfigureExtensions,
+  reconfigureKeymap,
+} = useEditorCore({ editorRef })
+
+/**
+ * 将外层传入的 snapshot 规范化后写入本地引用。
+ * sessionId / revision 会同时驱动两份滚动锚点控制器的读取与恢复资格判断。
+ *
+ * @param {{ sessionId?: string, revision?: number } | undefined} snapshot
+ */
+function updateCurrentScrollSnapshot(snapshot) {
+  currentScrollSnapshot.value = {
+    sessionId: typeof snapshot?.sessionId === 'string' ? snapshot.sessionId : '',
+    revision: Number.isInteger(snapshot?.revision) ? snapshot.revision : 0,
   }
 }
 
-function insertFileToEditor(fileInfo) {
-  if (fileInfo) {
-    const to = editorView.state.selection.main.to
-    // 如果当前行不为空的话，则需要使用换行符
-    const insert = `[${fileInfo.name}](<${fileInfo.path}>)`
-    editorView.dispatch({
-      changes: {
-        from: to,
-        to,
-        insert,
-      },
-      selection: { anchor: to + insert.length },
-    })
+/**
+ * 统一收拢恢复状态，避免多个出口重复手写同一组字段。
+ */
+function resetRestoreState() {
+  restoreState.value.active = false
+  restoreState.value.editorCode = false
+  restoreState.value.editorPreview = false
+}
+
+/**
+ * 统一设置滚动容器位置。
+ * 优先使用 scrollTo，兼容真实 DOM；测试或极简桩对象则退回直接赋值 scrollTop。
+ *
+ * @param {{ scrollTop?: number, scrollTo?: Function } | null | undefined} scrollElement
+ * @param {number} targetScrollTop
+ */
+function setScrollElementScrollTop(scrollElement, targetScrollTop) {
+  if (!scrollElement || Number.isFinite(targetScrollTop) !== true) {
+    return
+  }
+
+  if (typeof scrollElement.scrollTo === 'function') {
+    scrollElement.scrollTo({ top: targetScrollTop })
+    return
+  }
+
+  scrollElement.scrollTop = targetScrollTop
+}
+
+/**
+ * 解析预览元素携带的行号字段。
+ * Markdown 预览里的 data-line-* 来自 DOM dataset，因此这里统一转成正整数。
+ *
+ * @param {unknown} value
+ * @returns {number | null} 返回合法行号；非法值返回 null。
+ */
+function parsePreviewLineNumber(value) {
+  const lineNumber = Number(value)
+
+  if (!Number.isInteger(lineNumber) || lineNumber <= 0) {
+    return null
+  }
+
+  return lineNumber
+}
+
+/**
+ * 获取预览元素对应的 Markdown 行范围。
+ * lineEnd 缺失时退化为单行块，和现有预览渲染约定保持一致。
+ *
+ * @param {{ dataset?: Record<string, string> } | null | undefined} element
+ * @returns {{ lineStart: number, lineEnd: number } | null} 返回元素行范围；缺少有效映射时返回 null。
+ */
+function getPreviewElementLineRange(element) {
+  const lineStart = parsePreviewLineNumber(element?.dataset?.lineStart)
+  if (lineStart === null) {
+    return null
+  }
+
+  const parsedLineEnd = parsePreviewLineNumber(element?.dataset?.lineEnd)
+  const lineEnd = parsedLineEnd ?? lineStart
+
+  return {
+    lineStart,
+    lineEnd: Math.max(lineStart, lineEnd),
   }
 }
 
-function onInsertImgNetwork() {
-  validate().then(async () => {
-    imageNetworkModel.value = false
-    const fileInfo = await channelUtil.send({
-      event: 'upload-image',
-      data: {
-        mode: 'network',
-        name: imageNetworkData.name,
-        url: imageNetworkData.url,
-      },
-    })
-    editorUtil.insertImageToEditor(editorView, fileInfo)
-  }).catch(() => {})
-}
-
-// function uploadCallback() {
-//   const from = editorView.state.selection.main.from
-//   const to = editorView.state.selection.main.to
-//   return (strList) => {
-//     const str = strList.join('\n')
-//     editorView.dispatch({
-//       changes: { from, to, insert: str },
-//     })
-//     editorView.dispatch({
-//       selection: { anchor: from, head: from + str.length },
-//     })
-//   }
-// }
-
-// 按比例同步滚动逻辑
-// function syncScroll(sourceType) {
-//   if (scrolling.value) {
-//     return
-//   }
-//   scrolling.value = true
-//   // 获取滚动信息
-//   const [source, target] = sourceType === 'editor'
-//     ? [editorView.scrollDOM, previewRef.value]
-//     : [previewRef.value, editorView.scrollDOM]
-//
-//   // 计算滚动比例
-//   const ratio = source.scrollTop / (source.scrollHeight - source.clientHeight)
-//   const targetScrollTop = ratio * (target.scrollHeight - target.clientHeight)
-//
-//   // 同步到目标
-//   if (sourceType === 'editor') {
-//     previewRef.value.scrollTo({ top: targetScrollTop })
-//   } else {
-//     editorView.scrollDOM.scrollTo({ top: targetScrollTop })
-//   }
-//   requestAnimationFrame(() => {
-//     scrolling.value = false
-//   })
-// }
-
-// 查找匹配行号的元素
-function findPreviewElement(maxLineNumber, lineNumber, first) {
-  const elements = previewRef.value.querySelectorAll('[data-line-start]')
-  const waiting = []
-  for (const element of elements) {
-    const start = +element.dataset.lineStart
-    const end = +element.dataset.lineEnd || start
-    if (lineNumber >= start && lineNumber <= end) {
-      waiting.push({ element, start, end })
-    }
-  }
-  if (waiting.length === 0) {
-    if (lineNumber < maxLineNumber) {
-      return findPreviewElement(maxLineNumber, lineNumber + 1, false)
-    } else {
-      return { element: null, found: false }
-    }
-  }
-  waiting.sort((a, b) => (a.end - a.start) - (b.end - b.start))
-  return { element: waiting[0].element, found: first }
-}
-
-let checkScrollCallbackTimer
-
-function checkScrollTop(element, top, callback) {
-  // 清除之前的定时器
-  checkScrollCallbackTimer && clearTimeout(checkScrollCallbackTimer)
-
-  // 标准化目标滚动位置
-  top = Math.max(0, Math.min(element.scrollHeight - element.clientHeight, top))
-
-  // 定义滚动完成的处理函数
-  const handleScrollComplete = () => {
-    // 移除事件监听器
-    element.removeEventListener('scrollend', handleScrollComplete)
-    // 清除fallback定时器
-    clearTimeout(checkScrollCallbackTimer)
-    // 调用回调
-    callback && callback()
+/**
+ * 计算预览元素相对滚动容器内容顶部的真实位置。
+ * 这里和 usePreviewSync 保持同一套坐标语义，避免捕获与恢复采用两套不同坐标系。
+ *
+ * @param {HTMLElement | null | undefined} container
+ * @param {HTMLElement | null | undefined} element
+ * @returns {number | null} 返回元素真实顶部位置；无法计算时返回 null。
+ */
+function getPreviewElementToTopDistance(container, element) {
+  if (!container || !element) {
+    return null
   }
 
-  // 优先使用现代浏览器的scrollend事件
-  if ('onscrollend' in element) {
-    element.addEventListener('scrollend', handleScrollComplete, { once: true })
-
-    // 设置fallback定时器，防止scrollend事件因某些原因未触发
-    checkScrollCallbackTimer = setTimeout(() => {
-      element.removeEventListener('scrollend', handleScrollComplete)
-      callback && callback()
-    }, 1000) // 1秒超时，确保回调总会执行
-  } else {
-    // 旧浏览器降级方案：使用requestAnimationFrame进行更精确的轮询
-    let lastScrollTop = -1
-
-    const pollScroll = () => {
-      // 再次标准化目标位置（元素大小可能变化）
-      const normalizedTop = Math.max(0, Math.min(element.scrollHeight - element.clientHeight, top))
-
-      // 检查条件：
-      // 1. 滚动已达到目标位置附近（误差小于1px）
-      // 2. 滚动已停止（连续两次相同的scrollTop值）
-      if (Math.abs(element.scrollTop - normalizedTop) < 1 || element.scrollTop === lastScrollTop) {
-        callback && callback()
-      } else {
-        lastScrollTop = element.scrollTop
-        checkScrollCallbackTimer = requestAnimationFrame(pollScroll)
-      }
-    }
-
-    pollScroll()
+  const containerRect = container.getBoundingClientRect?.()
+  const elementRect = element.getBoundingClientRect?.()
+  if (!Number.isFinite(containerRect?.top) || !Number.isFinite(elementRect?.top)) {
+    return null
   }
+
+  return elementRect.top - containerRect.top - container.clientTop + container.scrollTop
 }
 
-function getTotalLineHeight(start, end) {
-  let height = 0
-  while (start <= end) {
-    height += editorView.lineBlockAt(editorView.state.doc.line(start).from).height
-    start++
+/**
+ * 统计元素相对预览滚动容器的嵌套深度。
+ * 当多个节点共享同一行范围时，优先选择更内层的真实内容节点。
+ *
+ * @param {HTMLElement | null | undefined} element
+ * @returns {number} 返回元素相对预览容器的嵌套深度。
+ */
+function getPreviewElementDepth(element) {
+  let depth = 0
+  let current = element
+
+  while (current && current !== previewRef.value) {
+    depth++
+    current = current.parentElement
   }
-  return height
+
+  return depth
 }
 
-// 获取指定滚动容器内元素到容器顶部的距离（包含滚动偏移）
-function getElementToTopDistance(targetElement, containerElement) {
-  // 获取元素和容器的位置信息
-  const trRect = targetElement.getBoundingClientRect()
-  const containerRect = containerElement.getBoundingClientRect()
-
-  // 计算相对位置（考虑容器边框和滚动位置）
-  return trRect.top - containerRect.top - containerElement.clientTop + containerElement.scrollTop
-}
-
-function jumpToTargetLine() {
+/**
+ * 获取当前预览区域中所有带行号映射的节点。
+ *
+ * @returns {HTMLElement[]} 返回当前预览容器内可用于锚点计算的节点列表。
+ */
+function getPreviewAnchorElements() {
   if (!previewRef.value) {
-    message.warning('请先打开预览')
-    return
+    return []
   }
-  // 找到对应的预览元素
-  const main = editorView.state.selection.main
-  const line = editorView.state.doc.lineAt(main.to)
-  const lineNumber = line.number
-  const previewElement = findPreviewElement(editorView.state.doc.lines, lineNumber, true)
-  if (previewElement.element && previewRef.value) {
-    const startLineNumber = +previewElement.element.dataset.lineStart
-    const endLineNumber = +previewElement.element.dataset.lineEnd
-    let targetScrollTop
-    if (startLineNumber === endLineNumber || previewElement.found === false) {
-      targetScrollTop = getElementToTopDistance(previewElement.element, previewRef.value)
-    } else {
-      const totalLineHeight = getTotalLineHeight(startLineNumber, endLineNumber)
-      const offsetHeight = getTotalLineHeight(startLineNumber, lineNumber - 1)
-      const scrollRatio = offsetHeight / totalLineHeight
-      const elementTop = getElementToTopDistance(previewElement.element, previewRef.value)
-      const elementHeight = previewElement.element.getBoundingClientRect().height
-      // 根据比例调整目标位置
-      targetScrollTop = elementTop + (elementHeight * scrollRatio)
-    }
-    // 平滑滚动到目标位置
-    previewRef.value.scrollTo({
-      top: targetScrollTop,
-      behavior: 'smooth',
-    })
-  }
+
+  return Array.from(previewRef.value.querySelectorAll('[data-line-start]'))
 }
 
-function syncEditorToPreview(refresh) {
-  if (scrolling.value.preview) {
-    return
-  }
-  if (!previewRef.value) {
-    return
-  }
+/**
+ * 根据当前 scrollTop 找到预览区最接近顶部的映射元素。
+ * 该查找策略与 usePreviewSync 内部逻辑保持一致，确保“当前看到的元素”和“同步映射元素”一致。
+ *
+ * @param {HTMLElement} container
+ * @param {number} scrollTop
+ * @returns {HTMLElement | null} 返回当前位置对应的预览元素；找不到时返回 null。
+ */
+function findPreviewElementAtScrollTop(container, scrollTop) {
+  const elements = getPreviewAnchorElements()
+  let target = elements[0] ?? null
 
-  // 若竖向滚动条值没改变则表示横向滚动 直接跳过
-  if (editorScrollTop.value === editorView.scrollDOM.scrollTop) {
-    if (refresh !== true) {
-      return
-    }
-  }
-  editorScrollTop.value = editorView.scrollDOM.scrollTop
-  // 获取编辑器滚动位置和可视区域高度
-  const scrollTop = editorView.scrollDOM.scrollTop
-
-  // 获取滚动位置对应的行块信息
-  const topBlock = editorView.lineBlockAtHeight(scrollTop)
-
-  // 计算当前行块的滚动比例
-  let totalLineHeight
-  let scrollOffsetInLine
-
-  // 找到对应的预览元素
-  const lineNumber = editorView.state.doc.lineAt(topBlock.from).number
-  const previewElement = findPreviewElement(editorView.state.doc.lines, lineNumber, true)
-  if (previewElement.element && previewRef.value) {
-    let targetScrollTop = 0
-    if (previewElement.found) {
-      const startLineNumber = +previewElement.element.dataset.lineStart
-      const endLineNumber = +previewElement.element.dataset.lineEnd
-      if (startLineNumber === endLineNumber) {
-        totalLineHeight = topBlock.height
-        scrollOffsetInLine = scrollTop - topBlock.top
-      } else {
-        totalLineHeight = getTotalLineHeight(startLineNumber, endLineNumber)
-        scrollOffsetInLine = startLineNumber === lineNumber ? scrollTop - topBlock.top : getTotalLineHeight(startLineNumber, lineNumber - 1) + scrollTop - topBlock.top
-      }
-      const scrollRatio = scrollOffsetInLine / totalLineHeight
-      // 计算预览元素的对应滚动位置
-      // const elementTop = previewElement.offsetTop
-      // 使用offsetTop某些标签会有问题（tr、tbody等表格标签）
-      const elementTop = getElementToTopDistance(previewElement.element, previewRef.value)
-      const elementHeight = previewElement.element.getBoundingClientRect().height
-
-      // 根据比例调整目标位置
-      targetScrollTop = elementTop + (elementHeight * scrollRatio)
-    } else {
-      targetScrollTop = getElementToTopDistance(previewElement.element, previewRef.value)
-    }
-
-    scrolling.value.editor = true
-
-    checkScrollTop(previewRef.value, targetScrollTop, () => {
-      scrolling.value.editor = false
-    })
-    // 平滑滚动到目标位置
-    previewRef.value.scrollTo({
-      top: targetScrollTop,
-      behavior: 'smooth',
-    })
-  }
-}
-
-// 根据滚动位置查找元素
-function findElementAtPreviewScroll(scrollTop) {
-  const elements = Array.from(previewRef.value.querySelectorAll('[data-line-start]'))
-  let target = elements[0]
   for (const element of elements) {
-    if (element.offsetTop <= scrollTop) {
+    const elementTop = getPreviewElementToTopDistance(container, element)
+    if (Number.isFinite(elementTop) && elementTop <= scrollTop) {
       target = element
     } else {
       break
     }
   }
+
   return target
 }
 
-function syncPreviewToEditor() {
-  if (scrolling.value.editor) {
-    return
+/**
+ * 根据锚点里的行范围反查预览元素。
+ * 若存在多个候选节点，则优先选择范围最精确、嵌套更深的那个节点。
+ *
+ * @param {HTMLElement} container
+ * @param {{ lineStart?: number, lineEnd?: number } | null | undefined} anchor
+ * @returns {HTMLElement | null} 返回锚点匹配到的预览元素；找不到时返回 null。
+ */
+function findPreviewElementByAnchor(container, anchor) {
+  const lineStart = parsePreviewLineNumber(anchor?.lineStart)
+  const lineEnd = parsePreviewLineNumber(anchor?.lineEnd) ?? lineStart
+
+  if (!container || lineStart === null || lineEnd === null) {
+    return null
   }
-  const previewScrollTop = previewRef.value.scrollTop
 
-  // 找到当前预览滚动位置对应的元素
-  const element = findElementAtPreviewScroll(previewScrollTop)
-  if (element && element.dataset.lineStart) {
-    const startLineNumber = +element.dataset.lineStart
-    const endLineNumber = +element.dataset.lineEnd
-
-    // 计算元素内滚动比例
-    const elementTop = getElementToTopDistance(element, previewRef.value)
-    const elementScrollOffset = previewScrollTop - elementTop
-    const scrollRatio = elementScrollOffset / element.getBoundingClientRect().height
-
-    // 找到编辑器的对应行
-    const startLine = editorView.state.doc.line(startLineNumber)
-    const totalLineHeight = getTotalLineHeight(startLineNumber, endLineNumber)
-    const block = editorView.lineBlockAt(startLine.from)
-
-    // 根据比例计算编辑器滚动位置
-    const targetScrollTop = block.top + (totalLineHeight * scrollRatio)
-    scrolling.value.preview = true
-    checkScrollTop(editorView.scrollDOM, targetScrollTop, () => {
-      scrolling.value.preview = false
-    })
-    // 平滑滚动编辑器
-    editorView.scrollDOM.scrollTo({
-      top: targetScrollTop,
-      behavior: 'smooth',
-    })
-  }
-}
-
-function onEditorWheel(e) {
-  // 按住shift表示横向滚动，跳过
-  if (e.shiftKey === true) {
-    return
-  }
-  if (previewRef.value) {
-    // e.deltaY > 0 表示往下滚动；且滚动条已到达底端
-    // e.deltaY < 0 表示往上滚动；且滚动条已到到顶端
-    if ((e.deltaY > 0 && editorView.scrollDOM.scrollHeight === editorView.scrollDOM.scrollTop + editorView.scrollDOM.clientHeight)
-      || (e.deltaY < 0 && editorView.scrollDOM.scrollTop === 0)
-    ) {
-      e.preventDefault()
-      previewRef.value.scrollBy({ top: e.deltaY, behavior: 'smooth' })
+  const waiting = []
+  for (const element of getPreviewAnchorElements()) {
+    const lineRange = getPreviewElementLineRange(element)
+    if (!lineRange) {
+      continue
+    }
+    if (lineRange.lineStart === lineStart && lineRange.lineEnd === lineEnd) {
+      waiting.push({
+        element,
+        depth: getPreviewElementDepth(element),
+        span: lineRange.lineEnd - lineRange.lineStart,
+      })
     }
   }
+
+  waiting.sort((a, b) => {
+    const spanCompare = a.span - b.span
+    if (spanCompare !== 0) {
+      return spanCompare
+    }
+    return b.depth - a.depth
+  })
+
+  return waiting[0]?.element ?? null
 }
 
-onBeforeUnmount(() => {
-  // 编辑器滚动监听
-  editorView.scrollDOM.removeEventListener('wheel', onEditorWheel)
-  editorView.scrollDOM.removeEventListener('scroll', syncEditorToPreview)
-  // 预览区滚动监听
-  // if (previewRef.value) {
-  //   previewRef.value.removeEventListener('scroll', syncPreviewToEditor)
-  // }
+const editorCodeScrollAnchor = useViewScrollAnchor({
+  store: viewScrollAnchorStore,
+  sessionIdGetter: () => currentScrollSnapshot.value.sessionId,
+  revisionGetter: () => currentScrollSnapshot.value.revision,
+  scrollAreaKey: 'editor-code',
+  getScrollElement: () => editorView.value?.scrollDOM ?? null,
+  captureAnchor: ({ scrollElement }) => {
+    const view = editorView.value
+    if (!view || !scrollElement) {
+      return null
+    }
+    return captureEditorLineAnchor({
+      view,
+      scrollTop: scrollElement.scrollTop,
+    })
+  },
+  restoreAnchor: ({ record, scrollElement }) => {
+    const view = editorView.value
+    if (!view || !scrollElement) {
+      return false
+    }
+    const targetScrollTop = resolveEditorLineAnchorScrollTop({
+      view,
+      anchor: record?.anchor,
+      fallbackScrollTop: record?.fallbackScrollTop,
+    })
+    setScrollElementScrollTop(scrollElement, targetScrollTop)
+    return true
+  },
 })
 
-// 绑定事件
-function bindEvents() {
-  // 编辑器滚动监听
-  editorView.scrollDOM.addEventListener('wheel', onEditorWheel)
-  editorView.scrollDOM.addEventListener('scroll', syncEditorToPreview)
-  // 预览区滚动监听
-  // previewRef.value.addEventListener('scroll', syncPreviewToEditor)
+const editorPreviewScrollAnchor = useViewScrollAnchor({
+  store: viewScrollAnchorStore,
+  sessionIdGetter: () => currentScrollSnapshot.value.sessionId,
+  revisionGetter: () => currentScrollSnapshot.value.revision,
+  scrollAreaKey: 'editor-preview',
+  getScrollElement: () => (previewController.value === true ? previewRef.value : null),
+  captureAnchor: ({ scrollElement }) => {
+    if (!scrollElement) {
+      return null
+    }
+    const targetElement = findPreviewElementAtScrollTop(scrollElement, scrollElement.scrollTop)
+    if (!targetElement) {
+      return null
+    }
+    return capturePreviewLineAnchor({
+      container: scrollElement,
+      element: targetElement,
+      scrollTop: scrollElement.scrollTop,
+    })
+  },
+  restoreAnchor: createMarkdownEditPreviewScrollAnchorRestore({
+    findPreviewElementByAnchor,
+    resolvePreviewLineAnchorScrollTop,
+    setScrollElementScrollTop,
+  }),
+})
+
+const captureViewScrollAnchors = createMarkdownEditScrollAnchorCapture({
+  updateCurrentScrollSnapshot,
+  editorCodeScrollAnchor,
+  editorPreviewScrollAnchor,
+  previewControllerRef: previewController,
+})
+
+const {
+  imageNetworkModel,
+  imageNetworkData,
+  imageNetworkDataRules,
+  insertFileToEditor,
+  openNetworkImageModal,
+  onInsertImgNetwork,
+  pasteOrDrop,
+} = useAssetInsert({ editorViewRef: editorView })
+
+const {
+  rebuildPreviewLayoutIndex,
+  previewSync: {
+    jumpToTargetLine,
+    jumpEditorToLine,
+    suppressNextPreviewToEditorSync,
+    syncEditorToPreview,
+    syncPreviewToEditor,
+    bindEvents,
+    unbindEvents,
+    clearScrollTimer,
+  },
+  associationHighlight: {
+    linkedSourceHighlightField,
+    linkedHighlightThemeStyle,
+    cancelScheduledCursorHighlight,
+    clearAllLinkedHighlight,
+    clearLinkedHighlightDisplay,
+    highlightByEditorCursor,
+    onPreviewAreaClick,
+    restorePreviewLinkedHighlight,
+  },
+} = createMarkdownEditPreviewLayoutIndexWiring({
+  previewRef,
+  usePreviewSync,
+  previewSyncOptions: {
+    editorViewRef: editorView,
+    previewRef,
+    scrolling,
+    editorScrollTop,
+    restoreStateRef: restoreState,
+  },
+  useAssociationHighlight,
+  associationHighlightOptions: {
+    editorViewRef: editorView,
+    previewRef,
+    previewController,
+    associationHighlight: associationHighlightEnabled,
+    themeRef,
+  },
+})
+
+const { onRefreshComplete } = createPreviewRefreshCoordinator({
+  rebuildPreviewLayoutIndex,
+  syncPreviewAfterRefresh: () => {
+    if (pendingPreviewResyncAfterRefresh.value !== true || previewController.value !== true) {
+      return
+    }
+
+    pendingPreviewResyncAfterRefresh.value = false
+    syncEditorToPreview(true)
+  },
+  restorePreviewLinkedHighlight,
+  closePreviewSearchBar,
+})
+
+const {
+  buildToolbarList,
+} = useToolbarBuilder({
+  t,
+  shortcutKeyList,
+  editorViewRef: editorView,
+  emits,
+  jumpToTargetLine,
+  previewVisible,
+  menuVisible,
+  previewRef,
+  openNetworkImageModal,
+  insertFileToEditor,
+})
+
+const editorContainerStyle = computed(() => {
+  return {
+    ...linkedHighlightThemeStyle.value,
+    '--wj-editor-bottom-gap': BOTTOM_GAP,
+    '--wj-preview-bottom-gap': BOTTOM_GAP,
+  }
+})
+
+const previewContainerStyle = computed(() => {
+  return {
+    paddingBottom: 'calc(var(--wj-preview-bottom-gap) + 0.5rem)',
+  }
+})
+
+const editorContainerClass = computed(() => layoutMode.value.gridTemplateClass)
+const layoutRenderItems = computed(() => resolveMarkdownEditRenderItems(layoutMode.value))
+const modelSyncScheduler = createFlushableDebounce(() => {
+  const view = editorView.value
+  if (!view) {
+    return
+  }
+  lastExposedContent.value = view.state.doc.toString()
+  // 输入稳定后再刷新关联高亮，避免在原生输入/DOMObserver 处理中追加第二次编辑器事务。
+  highlightByEditorCursor(view.state)
+  emits('update:modelValue', lastExposedContent.value)
+}, EDITOR_EMIT_DEBOUNCE_MS)
+
+/**
+ * 调度正文向父层上浮。
+ * 这里保留原有 160ms 防抖语义，只把实现替换成可 flush 的调度器。
+ */
+function scheduleModelSync() {
+  modelSyncScheduler.schedule()
 }
 
-// function updateEditorContent(newContent) {
-//   const transaction = editorView.state.update({
-//     changes: { from: 0, to: editorView.state.doc.length, insert: newContent },
-//   })
-//   editorView.dispatch(transaction)
-// }
+/**
+ * 立即冲刷挂起的正文上浮任务。
+ * 供页面切换前把最后一次输入同步到外层 session snapshot。
+ */
+function flushPendingModelSync() {
+  return modelSyncScheduler.flush()
+}
 
-const refresh = commonUtil.debounce(() => {
-  const doc = editorView.state.doc.toString()
-  emits('update:modelValue', doc)
-}, 100)
+/**
+ * 判断当前是否仍有待执行的正文上浮任务。
+ *
+ * @returns {boolean} 返回是否仍存在尚未执行的正文同步任务。
+ */
+function hasPendingModelSync() {
+  return modelSyncScheduler.hasPending()
+}
 
-// function refresh() {
-//   const doc = editorView.state.doc.toString()
-//   emits('update:modelValue', doc)
-// }
-
-function pasteOrDrop(event, view, types, files) {
-  if (types.includes('Files')) {
-    for (let i = 0; i < files.length; i++) {
-      const file = files.item(i)
-      if (file.type && file.type.startsWith('image/')) {
-        const reader = new FileReader()
-        reader.onload = async function (event) {
-          const fileInfo = await channelUtil.send({
-            event: 'upload-image',
-            data: {
-              mode: 'local',
-              type: file.type,
-              name: file.name,
-              base64: event.target.result,
-            },
-          })
-          insertImageToEditor(fileInfo)
-        }
-        reader.readAsDataURL(file)
-      } else {
-        const filePath = channelUtil.getWebFilePath(file)
-        channelUtil.send({ event: 'file-upload', data: filePath }).then((fileInfo) => {
-          insertFileToEditor(fileInfo)
-        }).catch(() => {})
-      }
-    }
-    // emits('upload', clipboardData.files, uploadCallback())
-    event.preventDefault()
-  }
+function refreshToolbarList() {
+  toolbarList.value = buildToolbarList()
 }
 
 function refreshKeymap() {
@@ -539,10 +589,10 @@ function refreshKeymap() {
     preventDefault: true,
     stopPropagation: true,
     run: () => {
-      if (useCommonStore().searchBarVisible === true) {
-        useCommonStore().searchBarVisible = false
+      if (store.searchBarVisible === true) {
+        previewSearchBarController.close(store)
       }
-      useCommonStore().editorSearchBarVisible = !useCommonStore().editorSearchBarVisible
+      store.editorSearchBarVisible = !store.editorSearchBarVisible
       return true
     },
   }
@@ -551,523 +601,599 @@ function refreshKeymap() {
   return keymapList
 }
 
-onMounted(() => {
-  menuVisible.value = useCommonStore().config.menuVisible
-  const keymapList = refreshKeymap()
-  splitInstance = Split({
-    columnGutters: [{ track: 1, element: gutterRef.value }],
-    // 最小尺寸
-    minSize: 200,
-    // 自动吸附距离
-    snapOffset: 0,
-  })
-  const dynamicExtensionList = []
-  for (const key in dynamicExtension) {
-    if (!props.extension || props.extension[key] !== false) {
-      dynamicExtensionList.push(dynamicExtension[key].compartment.of(dynamicExtension[key].extension))
-    }
-  }
-  editorView = new EditorView({
-    doc: props.modelValue,
-    lineWrapping: true,
-    extensions: [
-      themeCompartment.of(props.theme === 'dark' ? [oneDark] : []),
-      keymapCompartment.of(keymap.of(keymapList)),
-      ...editorExtensionUtil.getDefault(),
-      ...dynamicExtensionList,
-      EditorView.updateListener.of((update) => { // 监听更新
-        if (update.docChanged && isComposing.value === false) { // 检查文档是否发生变化
-          refresh()
-        }
-      }),
-      EditorView.domEventHandlers({
-        // 监听 IME 输入开始事件
-        compositionstart: () => {
-          // @codemirror/view固定为6.27.0版本，新版本(6.36.2)该事件不会正确触发
-          isComposing.value = true
-        },
-        // 监听 IME 输入结束事件
-        compositionend: () => {
-          // @codemirror/view固定为6.27.0版本，新版本(6.36.2)该事件不会正确触发
-          isComposing.value = false
-          refresh()
-        },
-        paste: (event, view) => {
-          const clipboardData = event.clipboardData
-          pasteOrDrop(event, view, clipboardData.types, clipboardData.files)
-        },
-        drop: (event, view) => {
-          const dataTransfer = event.dataTransfer
-          pasteOrDrop(event, view, dataTransfer.types, dataTransfer.files)
-          /* if (files.length > 0) {
-            event.preventDefault()
-            const file = files[0]
-            console.error(file)
-            const reader = new FileReader()
-            if (file.type.startsWith('image/')) {
-              // 处理图片文件
-              reader.onload = function (e) {
-                const imageUrl = e.target.result
-                view.dispatch({
-                  changes: {
-                    from: view.state.selection.main.from,
-                    insert: `![image](${imageUrl})`,
-                  },
-                })
-              }
-              reader.readAsDataURL(file)
-            } else {
-              // 处理文本文件
-              reader.onload = function (e) {
-                const fileContent = e.target.result
-                view.dispatch({
-                  changes: {
-                    from: view.state.selection.main.from,
-                    insert: fileContent,
-                  },
-                })
-              }
-              reader.readAsText(file)
-            }
-          } */
-        },
-      }),
-    ],
-    parent: editorRef.value,
-  })
-  nextTick(() => {
-    bindEvents()
-  })
-})
-
-function getKeymapByShortcutKeyId(id) {
-  const shortcutKey = shortcutKeyList.value.find(item => item.id === id && item.enabled === true)
-  if (shortcutKey) {
-    return shortcutKey.keymap
-  }
-  return ''
+/**
+ * 用布局 helper 的列顺序同步当前可见面板，避免组件再维护第二套“左右顺序”判断。
+ */
+function syncLayoutControllers() {
+  previewController.value = layoutMode.value.columnOrder.includes('preview')
+  menuController.value = layoutMode.value.columnOrder.includes('menu')
 }
 
 /**
- * 处理字符串指定范围内的颜色标记
- * @param {string} originalStr 原始字符串
- * @param {string} color 颜色值(如"red"或"#ff0000")
- * @param {number} startIndex 开始坐标
- * @param {number} endIndex 结束坐标
- * @returns {string} 处理后的字符串
+ * 按 helper 返回的 gutter 描述解析 Split 需要的真实 DOM。
+ * refKey 明确区分预览分隔条与大纲分隔条，避免左侧三栏时绑反。
+ *
+ * @returns {Array<{ track: number, element: HTMLElement | undefined }>} 返回可直接传给 Split 的 gutter 配置。
  */
-function applyColorToRange(originalStr, color, startIndex, endIndex) {
-  // 检查坐标是否有效
-  if (startIndex < 0 || endIndex > originalStr.length || startIndex > endIndex) {
-    throw new Error('Invalid range coordinates')
+function resolveSplitColumnGutters() {
+  const gutterRefMap = {
+    gutterRef: gutterRef.value,
+    gutterMenuRef: gutterMenuRef.value,
   }
 
-  // 提取目标子字符串
-  const targetSubstring = originalStr.substring(startIndex, endIndex)
+  // 真实的 refKey -> gutter element 绑定已下沉到纯函数中，等价于 gutterRefMap[refKey]。
+  return resolveMarkdownEditSplitColumnGutters(layoutMode.value.columnGutters, gutterRefMap)
+}
 
-  // 检查是否已被颜色语法包裹
-  const colorSyntaxRegex = /^\{([^}]+)\}\(([^)]+)\)$/
-  const isWrapped = colorSyntaxRegex.test(targetSubstring)
+/**
+ * 把当前布局的计算后列宽快照写回行内样式。
+ * split-grid 在拖拽开始时会重新读取轨道定义，这里用于给它提供稳定的 px 结果。
+ */
+function syncInlineGridTemplateColumnsFromComputedStyle() {
+  if (!editorContainer.value) {
+    return
+  }
 
-  // 处理不同情况
-  if (isWrapped) {
-    // 情况1：已被包裹，只修改颜色值
-    const match = targetSubstring.match(colorSyntaxRegex)
-    const newWrapped = `{${color}}(${match[2]})`
-    return (
-      originalStr.substring(0, startIndex)
-      + newWrapped
-      + originalStr.substring(endIndex)
-    )
-  } else {
-    // 情况2：未被包裹，添加颜色语法
-    const newWrapped = `{${color}}(${targetSubstring})`
-    return (
-      originalStr.substring(0, startIndex)
-      + newWrapped
-      + originalStr.substring(endIndex)
-    )
+  const computedGridTemplateColumns = window.getComputedStyle(editorContainer.value).gridTemplateColumns
+  if (!computedGridTemplateColumns) {
+    return
+  }
+
+  editorContainer.value.style['grid-template-columns'] = computedGridTemplateColumns
+}
+
+/**
+ * 拖拽结束后把像素列宽重新换回 fr 轨道。
+ * 这样既保留本次拖拽得到的相对比例，又不会在窗口缩放后把布局锁死在旧像素值上。
+ */
+function syncInlineGridTemplateColumnsAsAdaptiveTracks() {
+  if (!editorContainer.value) {
+    return
+  }
+
+  const computedGridTemplateColumns = window.getComputedStyle(editorContainer.value).gridTemplateColumns
+  const adaptiveGridTemplateColumns = resolveAdaptiveGridTemplateColumns(computedGridTemplateColumns)
+  if (!adaptiveGridTemplateColumns) {
+    return
+  }
+
+  editorContainer.value.style['grid-template-columns'] = adaptiveGridTemplateColumns
+}
+
+/**
+ * 给当前 gutter 绑定“拖拽前同步列宽”的 capture 监听。
+ * 这样可以确保 split-grid 自己的 mousedown / touchstart 处理前，已经拿到稳定的行内轨道定义。
+ *
+ * @param {Array<{ element: HTMLElement | undefined }>} columnGutters
+ */
+function bindSplitGutterSyncListeners(columnGutters) {
+  unbindSplitGutterSyncListeners()
+
+  splitGutterSyncElements = Array.from(new Set(
+    columnGutters
+      .map(({ element }) => element)
+      .filter(Boolean),
+  ))
+
+  for (const element of splitGutterSyncElements) {
+    element.addEventListener('mousedown', syncInlineGridTemplateColumnsFromComputedStyle, true)
+    element.addEventListener('touchstart', syncInlineGridTemplateColumnsFromComputedStyle, true)
   }
 }
 
-function onTextColorChange(color) {
-  const main = editorView.state.selection.main
-  if (main.from === main.to) {
+/**
+ * 解绑当前 gutter 上的拖拽前同步监听，避免布局切换后继续引用旧 DOM。
+ */
+function unbindSplitGutterSyncListeners() {
+  for (const element of splitGutterSyncElements) {
+    element.removeEventListener('mousedown', syncInlineGridTemplateColumnsFromComputedStyle, true)
+    element.removeEventListener('touchstart', syncInlineGridTemplateColumnsFromComputedStyle, true)
+  }
+
+  splitGutterSyncElements = []
+}
+
+/**
+ * 释放当前 Split 实例和它留下的行内列宽。
+ * 这样布局切换到另一套列模板时，不会继续沿用旧的拖拽结果。
+ */
+function destroySplitLayout() {
+  unbindSplitGutterSyncListeners()
+
+  if (editorContainer.value) {
+    editorContainer.value.style['grid-template-columns'] = ''
+  }
+
+  splitInstance && splitInstance.destroy(true)
+  splitInstance = undefined
+}
+
+/**
+ * 重新按当前布局初始化 Split。
+ * 会先清理旧实例，再按 helper 描述挂载当前需要的 gutter。
+ */
+function resetSplitLayout() {
+  destroySplitLayout()
+
+  const columnGutters = resolveSplitColumnGutters()
+  if (columnGutters.length === 0) {
     return
   }
-  const fromLine = editorView.state.doc.lineAt(main.from)
-  const toLine = editorView.state.doc.lineAt(main.to)
-  if (fromLine.number !== toLine.number) {
-    return
-  }
-  const lineText = fromLine.text
-  const convertedText = applyColorToRange(lineText, color, main.from - fromLine.from, main.to - fromLine.from)
-  editorView.dispatch({
-    changes: {
-      from: fromLine.from,
-      to: fromLine.to,
-      insert: convertedText,
-    },
-    selection: { anchor: main.from, head: fromLine.from + convertedText.length - (fromLine.to - main.to) },
+
+  bindSplitGutterSyncListeners(columnGutters)
+
+  splitInstance = Split({
+    columnGutters,
+    minSize: 200,
+    snapOffset: 0,
+    onDragEnd: syncInlineGridTemplateColumnsAsAdaptiveTracks,
   })
 }
 
-function refreshToolbarList() {
-  const defaultToolbar = {
-    bold: {
-      label: t('shortcutKey.editor-bold'),
-      icon: 'i-tabler:bold',
-      shortcutKey: getKeymapByShortcutKeyId('editor-bold'),
-      action: () => { editorUtil.bold(editorView) },
-    },
-    underline: {
-      label: t('shortcutKey.editor-underline'),
-      icon: 'i-tabler:underline',
-      shortcutKey: getKeymapByShortcutKeyId('editor-underline'),
-      action: () => { editorUtil.underline(editorView) },
-    },
-    italic: {
-      label: t('shortcutKey.editor-italic'),
-      icon: 'i-tabler:italic',
-      shortcutKey: getKeymapByShortcutKeyId('editor-italic'),
-      action: () => { editorUtil.italic(editorView) },
-    },
-    strikeThrough: {
-      label: t('shortcutKey.editor-del'),
-      icon: 'i-tabler:a-b-off',
-      shortcutKey: getKeymapByShortcutKeyId('editor-del'),
-      action: () => { editorUtil.strikeThrough(editorView) },
-    },
-    heading: {
-      label: t('editor.heading'),
-      icon: 'i-tabler:heading',
-      menuList: [
-        {
-          label: getKeymapByShortcutKeyId('editor-heading-1') ? commonUtil.createLabel(t('shortcutKey.editor-heading-1'), getKeymapByShortcutKeyId('editor-heading-1')) : t('shortcutKey.editor-heading-1'),
-          action: () => { editorUtil.heading(editorView, 1) },
-        },
-        {
-          label: getKeymapByShortcutKeyId('editor-heading-2') ? commonUtil.createLabel(t('shortcutKey.editor-heading-2'), getKeymapByShortcutKeyId('editor-heading-2')) : t('shortcutKey.editor-heading-2'),
-          action: () => { editorUtil.heading(editorView, 2) },
-        },
-        {
-          label: getKeymapByShortcutKeyId('editor-heading-3') ? commonUtil.createLabel(t('shortcutKey.editor-heading-3'), getKeymapByShortcutKeyId('editor-heading-3')) : t('shortcutKey.editor-heading-3'),
-          action: () => { editorUtil.heading(editorView, 3) },
-        },
-        {
-          label: getKeymapByShortcutKeyId('editor-heading-4') ? commonUtil.createLabel(t('shortcutKey.editor-heading-4'), getKeymapByShortcutKeyId('editor-heading-4')) : t('shortcutKey.editor-heading-4'),
-          action: () => { editorUtil.heading(editorView, 4) },
-        },
-        {
-          label: getKeymapByShortcutKeyId('editor-heading-5') ? commonUtil.createLabel(t('shortcutKey.editor-heading-5'), getKeymapByShortcutKeyId('editor-heading-5')) : t('shortcutKey.editor-heading-5'),
-          action: () => { editorUtil.heading(editorView, 5) },
-        },
-        {
-          label: getKeymapByShortcutKeyId('editor-heading-6') ? commonUtil.createLabel(t('shortcutKey.editor-heading-6'), getKeymapByShortcutKeyId('editor-heading-6')) : t('shortcutKey.editor-heading-6'),
-          action: () => { editorUtil.heading(editorView, 6) },
-        },
-      ],
-    },
-    subscript: {
-      label: t('shortcutKey.editor-subscript'),
-      icon: 'i-tabler:subscript',
-      shortcutKey: getKeymapByShortcutKeyId('editor-subscript'),
-      action: () => { editorUtil.subscript(editorView) },
-    },
-    superscript: {
-      label: t('shortcutKey.editor-superscript'),
-      icon: 'i-tabler:superscript',
-      shortcutKey: getKeymapByShortcutKeyId('editor-superscript'),
-      action: () => { editorUtil.superscript(editorView) },
-    },
-    quote: {
-      label: t('shortcutKey.editor-quote'),
-      icon: 'i-tabler:quote-filled',
-      shortcutKey: getKeymapByShortcutKeyId('editor-quote'),
-      action: () => { editorUtil.quote(editorView) },
-    },
-    list: {
-      label: t('shortcutKey.editor-list'),
-      icon: 'i-tabler:list',
-      shortcutKey: getKeymapByShortcutKeyId('editor-list'),
-      action: () => { editorUtil.list(editorView) },
-    },
-    numberList: {
-      label: t('shortcutKey.editor-list-numbers'),
-      icon: 'i-tabler:list-numbers',
-      shortcutKey: getKeymapByShortcutKeyId('editor-list-numbers'),
-      action: () => { editorUtil.numberList(editorView) },
-    },
-    taskList: {
-      label: t('shortcutKey.editor-list-check'),
-      icon: 'i-tabler:list-check',
-      shortcutKey: getKeymapByShortcutKeyId('editor-list-check'),
-      action: () => { editorUtil.taskList(editorView) },
-    },
-    code: {
-      label: t('shortcutKey.editor-code-inline'),
-      icon: 'i-tabler:terminal',
-      shortcutKey: getKeymapByShortcutKeyId('editor-code-inline'),
-      action: () => { editorUtil.code(editorView) },
-    },
-    blockCode: {
-      label: t('shortcutKey.editor-code-block'),
-      icon: 'i-tabler:terminal-2',
-      shortcutKey: getKeymapByShortcutKeyId('editor-code-block'),
-      action: () => { editorUtil.blockCode(editorView) },
-    },
-    link: {
-      label: t('shortcutKey.editor-link'),
-      icon: 'i-tabler:link',
-      shortcutKey: getKeymapByShortcutKeyId('editor-link'),
-      action: () => { editorUtil.link(editorView) },
-    },
-    mark: {
-      label: t('shortcutKey.editor-mark'),
-      icon: 'i-tabler:brush',
-      shortcutKey: getKeymapByShortcutKeyId('editor-mark'),
-      action: () => { editorUtil.mark(editorView) },
-    },
-    table: {
-      label: t('editor.table'),
-      icon: 'i-tabler:table',
-      popover: createVNode(TableShape, { col: 6, row: 6, onSelect: (row, col) => {
-        const main = editorView.state.selection.main
-        editorUtil.insertTable(editorView, row, col, main.from, main.to)
-      } }),
-    },
-    alert: {
-      label: t('editor.alert'),
-      icon: 'i-tabler:alert-square',
-      menuList: [
-        { label: 'note', action: () => { editorUtil.alertContainer(editorView, 'note') } },
-        { label: 'tip', action: () => { editorUtil.alertContainer(editorView, 'tip') } },
-        { label: 'important', action: () => { editorUtil.alertContainer(editorView, 'important') } },
-        { label: 'warning', action: () => { editorUtil.alertContainer(editorView, 'warning') } },
-        { label: 'caution', action: () => { editorUtil.alertContainer(editorView, 'caution') } },
-      ],
-    },
-    container: {
-      label: t('editor.container'),
-      icon: 'i-tabler:container',
-      menuList: [
-        { label: 'info', action: () => { editorUtil.container(editorView, 'info') } },
-        { label: 'tip', action: () => { editorUtil.container(editorView, 'tip') } },
-        { label: 'important', action: () => { editorUtil.container(editorView, 'important') } },
-        { label: 'warning', action: () => { editorUtil.container(editorView, 'warning') } },
-        { label: 'danger', action: () => { editorUtil.container(editorView, 'danger') } },
-        { label: 'details', action: () => { editorUtil.container(editorView, 'details') } },
-      ],
-    },
-    image: {
-      label: t('editor.image'),
-      icon: 'i-tabler:photo',
-      menuList: [
-        {
-          label: getKeymapByShortcutKeyId('editor-image-template') ? commonUtil.createLabel(t('shortcutKey.editor-image-template'), getKeymapByShortcutKeyId('editor-image-template')) : t('shortcutKey.editor-image-template'),
-          action: () => { editorUtil.image(editorView) },
-        },
-        {
-          label: t('editor.localImage'),
-          action: () => { editorUtil.imageLocal(editorView) },
-        },
-        {
-          label: t('editor.networkImage'),
-          action: () => {
-            imageNetworkData.name = undefined
-            imageNetworkData.url = undefined
-            imageNetworkModel.value = true
-          },
-        },
-        {
-          label: getKeymapByShortcutKeyId('editor-screenshot') ? commonUtil.createLabel(t('shortcutKey.editor-screenshot'), getKeymapByShortcutKeyId('editor-screenshot')) : t('shortcutKey.editor-screenshot'),
-          action: () => { editorUtil.screenshot(editorView, false) },
-        },
-        {
-          label: getKeymapByShortcutKeyId('editor-screenshot-hide') ? commonUtil.createLabel(t('shortcutKey.editor-screenshot-hide'), getKeymapByShortcutKeyId('editor-screenshot-hide')) : t('shortcutKey.editor-screenshot-hide'),
-          action: () => { editorUtil.screenshot(editorView, true) },
-        },
-      ],
-    },
-    file: {
-      label: t('editor.file'),
-      icon: 'i-tabler:file',
-      action: () => {
-        const input = document.createElement('input')
-        input.type = 'file'
-        input.addEventListener('change', (event) => {
-          if (event.target && event.target.files && event.target.files.length > 0) {
-            const file = event.target.files[0]
-            const filePath = channelUtil.getWebFilePath(file)
-            channelUtil.send({ event: 'file-upload', data: filePath }).then((fileInfo) => {
-              insertFileToEditor(fileInfo)
-            }).catch(() => {})
-          }
-        })
-        input.click()
-        editorView.focus()
-      },
-    },
-    video: {
-      label: t('editor.video'),
-      icon: 'i-tabler:video',
-      menuList: [
-        {
-          label: t('editor.insertTemplate'),
-          action: () => { editorUtil.video(editorView) },
-        },
-        {
-          label: t('editor.localVideo'),
-          action: () => { editorUtil.videoLocal(editorView) },
-        },
-      ],
-    },
-    audio: {
-      label: t('editor.audio'),
-      icon: 'i-tabler:device-audio-tape',
-      menuList: [
-        {
-          label: t('editor.insertTemplate'),
-          action: () => { editorUtil.audio(editorView) },
-        },
-        {
-          label: t('editor.localAudio'),
-          action: () => { editorUtil.audioLocal(editorView) },
-        },
-      ],
-    },
-    undo: {
-      label: t('editor.undo'),
-      icon: 'i-tabler:arrow-back-up',
-      shortcutKey: 'Ctrl+z',
-      action: () => { editorUtil.undo(editorView) },
-    },
-    redo: {
-      label: t('editor.redo'),
-      icon: 'i-tabler:arrow-forward-up',
-      shortcutKey: 'Ctrl+y',
-      action: () => { editorUtil.redo(editorView) },
-    },
-    textColor: {
-      label: t('editor.textColor'),
-      icon: 'i-tabler:color-picker',
-      popover: createVNode(ColorPicker, {
-        'is-widget': true,
-        'picker-type': 'chrome',
-        'use-type': 'both',
-        'onPureColorChange': onTextColorChange,
-        'onGradientColorChange': onTextColorChange,
-      }, { extra: () => h('div', {}, t('editor.textColorTip')) }),
-    },
-    focusLine: {
-      label: t('shortcutKey.editor-focus-line'),
-      icon: 'i-tabler:focus-2',
-      shortcutKey: getKeymapByShortcutKeyId('editor-focus-line'),
-      action: jumpToTargetLine,
-    },
-    previewVisible: {
-      label: t('editor.preview'),
-      icon: 'i-tabler:eye',
-      action: () => { previewVisible.value = !previewVisible.value },
-    },
-    menuVisible: {
-      label: t('outline'),
-      icon: 'i-tabler:menu-2',
-      action: () => {
-        if (previewRef.value) {
-          menuVisible.value = !menuVisible.value
-        } else {
-          message.warning(t('editor.outlineTip'))
+/**
+ * 按固定顺序恢复当前快照对应的滚动位置：
+ * 1. 打开恢复保护
+ * 2. 恢复左侧编辑区
+ * 3. 若右侧预览可见，再恢复右侧预览区
+ * 4. 关闭恢复保护
+ *
+ * 使用 request token 防止旧恢复请求在新恢复开始后回写错误状态。
+ *
+ * @param {{ sessionId?: string, revision?: number } | undefined} snapshot
+ * @returns {Promise<{ editorCode: boolean, editorPreview: boolean }>} 返回左右区域本轮是否实际完成恢复。
+ */
+async function scheduleRestoreForCurrentSnapshot(snapshot) {
+  updateCurrentScrollSnapshot(snapshot)
+  const requestToken = ++viewRestoreRequestToken
+
+  editorCodeScrollAnchor.cancelPendingRestore()
+  editorPreviewScrollAnchor.cancelPendingRestore()
+  restoreState.value.active = true
+  restoreState.value.editorCode = false
+  restoreState.value.editorPreview = false
+
+  const restoreResult = {
+    editorCode: false,
+    editorPreview: false,
+  }
+
+  try {
+    restoreState.value.editorCode = true
+    try {
+      restoreResult.editorCode = await editorCodeScrollAnchor.scheduleRestoreForCurrentSnapshot()
+    } finally {
+      if (requestToken === viewRestoreRequestToken) {
+        restoreState.value.editorCode = false
+      }
+    }
+
+    if (previewController.value === true) {
+      restoreState.value.editorPreview = true
+      try {
+        restoreResult.editorPreview = await editorPreviewScrollAnchor.scheduleRestoreForCurrentSnapshot()
+      } finally {
+        if (requestToken === viewRestoreRequestToken) {
+          restoreState.value.editorPreview = false
         }
-      },
-    },
-    prettier: {
-      label: t('editor.prettier'),
-      icon: 'i-tabler:circle-letter-p',
-      action: () => { editorUtil.doPrettier(editorView) },
-    },
-    save: {
-      label: t('shortcutKey.save'),
-      icon: 'i-tabler:file-check',
-      shortcutKey: getKeymapByShortcutKeyId('save'),
-      action: () => { emits('save', editorView.state.doc.toString()) },
-    },
+      }
+    }
+
+    return restoreResult
+  } finally {
+    if (requestToken === viewRestoreRequestToken) {
+      resetRestoreState()
+    }
   }
-  const toolbarListTemp = []
-  for (const key in defaultToolbar) {
-    toolbarListTemp.push(defaultToolbar[key])
-  }
-  toolbarList.value = toolbarListTemp
 }
-watch(() => useCommonStore().config.shortcutKeyList, (newValue) => {
-  shortcutKeyList.value = newValue
-  refreshToolbarList()
-  if (editorView) {
-    editorView.dispatch({
-      effects: keymapCompartment.reconfigure(keymap.of(refreshKeymap())),
-    })
-  }
-}, { deep: true, immediate: true })
+
+/**
+ * 取消当前挂起的滚动恢复请求，并立即解除恢复保护状态。
+ */
+function cancelPendingViewScrollRestore() {
+  viewRestoreRequestToken++
+  editorCodeScrollAnchor.cancelPendingRestore()
+  editorPreviewScrollAnchor.cancelPendingRestore()
+  resetRestoreState()
+}
 
 function onAnchorChange(changedAnchorList) {
   anchorList.value = changedAnchorList
   emits('anchorChange', changedAnchorList)
 }
 
-watch(() => [menuVisible.value, previewVisible.value], () => {
-  editorContainer.value.style['grid-template-columns'] = ''
-  splitInstance.destroy(true)
-  gridAnimation.value = true
-  if (menuVisible.value && previewVisible.value) {
-    previewController.value = true
-    menuController.value = true
-    nextTick(() => {
-      splitInstance = Split({
-        columnGutters: [{ track: 1, element: gutterRef.value }, { track: 3, element: gutterMenuRef.value }],
-        // 最小尺寸
-        minSize: 200,
-        // 自动吸附距离
-        snapOffset: 0,
-      })
-      setTimeout(() => {
-        syncEditorToPreview(true)
-      }, 500)
-    })
-  } else if (previewVisible.value) {
-    previewController.value = true
-    menuController.value = false
-    nextTick(() => {
-      splitInstance = Split({
-        columnGutters: [{ track: 1, element: gutterRef.value }],
-        // 最小尺寸
-        minSize: 200,
-        // 自动吸附距离
-        snapOffset: 0,
-      })
-      setTimeout(() => {
-        syncEditorToPreview(true)
-      }, 500)
-    })
-  } else {
-    previewController.value = false
+function onOutlineNavigate(payload) {
+  const lineStart = Number(payload?.lineStart)
+  if (!Number.isInteger(lineStart) || lineStart <= 0) {
+    return
   }
-  setTimeout(() => {
-    gridAnimation.value = false
-  }, 500)
-})
 
-function onImageContextmenu(src) {
-  emits('imageContextmenu', src)
+  if (payload?.didPreviewScroll === true) {
+    suppressNextPreviewToEditorSync()
+  }
+  jumpEditorToLine(lineStart, { suppressEditorToPreviewSync: true })
 }
 
-const editorContainerClass = computed(() => {
-  if (previewController.value && menuController.value) {
-    return 'grid-cols-[1fr_2px_1fr_2px_0.4fr]'
-  } else if (previewController.value) {
-    return 'grid-cols-[1fr_2px_1fr_0px_0fr]'
-  } else {
-    return 'grid-cols-[1fr_0px_0fr_0px_0fr]'
+function onPreviewContextmenu(context) {
+  emits('previewContextmenu', context)
+}
+
+function onAssetOpen(assetInfo) {
+  emits('assetOpen', assetInfo)
+}
+
+function setEditorElement(element) {
+  editorRef.value = element
+}
+
+function setPreviewElement(element) {
+  previewRef.value = element
+}
+
+function setPreviewGutterElement(element) {
+  gutterRef.value = element
+}
+
+function setMenuGutterElement(element) {
+  gutterMenuRef.value = element
+}
+
+function getCurrentEditorContent(view = editorView.value) {
+  return view?.state?.doc?.toString?.() ?? ''
+}
+
+function markHandledContentUpdateToken(token) {
+  if (Number.isInteger(token) !== true || token <= handledContentUpdateToken.value) {
+    return
   }
+
+  handledContentUpdateToken.value = token
+}
+
+function createPendingExternalSyncPayload({
+  nextContent,
+  pendingContentUpdateMeta,
+  cursorPosition,
+}) {
+  return {
+    nextContent,
+    pendingContentUpdateMeta,
+    cursorPosition,
+    contentUpdateToken: pendingContentUpdateMeta.nextHandledToken,
+  }
+}
+
+function applyExternalEditorSync({
+  view,
+  nextContent,
+  pendingContentUpdateMeta,
+  cursorPosition,
+}) {
+  const currentValue = getCurrentEditorContent(view)
+
+  if (currentValue !== nextContent) {
+    const transaction = {
+      changes: {
+        from: 0,
+        to: currentValue.length,
+        insert: nextContent,
+      },
+    }
+    if (cursorPosition !== null) {
+      transaction.selection = {
+        anchor: cursorPosition,
+        head: cursorPosition,
+      }
+      transaction.scrollIntoView = pendingContentUpdateMeta.scrollIntoView
+    }
+    view.dispatch(transaction)
+  } else if (cursorPosition !== null) {
+    view.dispatch({
+      selection: {
+        anchor: cursorPosition,
+        head: cursorPosition,
+      },
+      scrollIntoView: pendingContentUpdateMeta.scrollIntoView,
+    })
+  }
+
+  if (cursorPosition !== null && pendingContentUpdateMeta.focus === true) {
+    view.focus()
+  }
+
+  lastExposedContent.value = nextContent
+  restorePreviewLinkedHighlight()
+}
+
+function flushPendingExternalSync() {
+  const payload = pendingExternalSync.value
+  if (!payload) {
+    return false
+  }
+
+  const view = editorView.value
+  if (!view) {
+    return false
+  }
+
+  const currentValue = getCurrentEditorContent(view)
+  const compositionActive = isCompositionActive()
+  if (shouldDeferExternalEditorDispatch({
+    compositionActive,
+    currentContent: currentValue,
+    nextContent: payload.nextContent,
+    shouldApplySelection: payload.pendingContentUpdateMeta.shouldApplySelection,
+  })) {
+    return false
+  }
+
+  pendingExternalSync.value = null
+
+  if (shouldDeferStaleContentSync({
+    currentContent: currentValue,
+    nextContent: payload.nextContent,
+    lastExposedContent: lastExposedContent.value,
+    hasExplicitSelection: payload.pendingContentUpdateMeta.shouldApplySelection,
+  })) {
+    markHandledContentUpdateToken(payload.contentUpdateToken)
+    restorePreviewLinkedHighlight()
+    return true
+  }
+
+  applyExternalEditorSync({
+    view,
+    nextContent: payload.nextContent,
+    pendingContentUpdateMeta: payload.pendingContentUpdateMeta,
+    cursorPosition: payload.cursorPosition,
+  })
+  markHandledContentUpdateToken(payload.contentUpdateToken)
+  return true
+}
+
+function syncExternalModelValue(newValue = props.modelValue) {
+  const view = editorView.value
+  const pendingContentUpdateMeta = resolvePendingContentUpdateMeta({
+    handledToken: handledContentUpdateToken.value,
+    contentUpdateMeta: props.contentUpdateMeta,
+  })
+
+  const cursorPosition = pendingContentUpdateMeta.shouldApplySelection
+    ? Math.max(0, Math.min(newValue.length, pendingContentUpdateMeta.cursorPosition))
+    : null
+
+  if (!view) {
+    pendingExternalSync.value = pendingContentUpdateMeta.shouldApplySelection === true
+      ? createPendingExternalSyncPayload({
+          nextContent: newValue,
+          pendingContentUpdateMeta,
+          cursorPosition,
+        })
+      : null
+    lastExposedContent.value = newValue
+    restorePreviewLinkedHighlight()
+    return
+  }
+
+  const currentValue = getCurrentEditorContent(view)
+
+  // 编辑器已经继续输入、但父层这时只回放了上一轮已上浮内容时，说明拿到的是滞后的 echo。
+  // 这类内容如果整段重放，会把 CodeMirror 光标错误映射到文首。
+  if (shouldDeferStaleContentSync({
+    currentContent: currentValue,
+    nextContent: newValue,
+    lastExposedContent: lastExposedContent.value,
+    hasExplicitSelection: pendingContentUpdateMeta.shouldApplySelection,
+  })) {
+    pendingExternalSync.value = null
+    markHandledContentUpdateToken(pendingContentUpdateMeta.nextHandledToken)
+    restorePreviewLinkedHighlight()
+    return
+  }
+
+  const compositionActive = isCompositionActive()
+  if (shouldDeferExternalEditorDispatch({
+    compositionActive,
+    currentContent: currentValue,
+    nextContent: newValue,
+    shouldApplySelection: pendingContentUpdateMeta.shouldApplySelection,
+  })) {
+    pendingExternalSync.value = createPendingExternalSyncPayload({
+      nextContent: newValue,
+      pendingContentUpdateMeta,
+      cursorPosition,
+    })
+    restorePreviewLinkedHighlight()
+    return
+  }
+
+  // 一旦当前这次外部同步已经可以直接落到编辑器，先丢弃更早的挂起 payload，
+  // 避免 onCompositionIdle 的延后冲刷把更新过的新快照回滚成旧状态。
+  pendingExternalSync.value = null
+
+  applyExternalEditorSync({
+    view,
+    nextContent: newValue,
+    pendingContentUpdateMeta,
+    cursorPosition,
+  })
+  markHandledContentUpdateToken(pendingContentUpdateMeta.nextHandledToken)
+}
+
+async function onInsertNetworkImage() {
+  try {
+    await onInsertImgNetwork()
+  } catch {
+    // 表单校验失败时保持弹窗状态，不做额外处理
+  }
+}
+
+watch(() => props.theme, (newValue) => {
+  reconfigureTheme(newValue)
+})
+
+watch(() => props.extension, (newValue) => {
+  reconfigureExtensions(newValue)
+}, { deep: true })
+
+watch(() => [props.modelValue, props.contentUpdateMeta?.token], ([newValue]) => {
+  syncExternalModelValue(newValue)
+}, { immediate: true })
+
+watch(() => props.associationHighlight, (enabled) => {
+  if (enabled === true) {
+    nextTick(() => {
+      highlightByEditorCursor()
+    })
+  } else {
+    clearAllLinkedHighlight()
+  }
+})
+
+watch(() => store.config.shortcutKeyList, (newValue) => {
+  shortcutKeyList.value = newValue
+  refreshToolbarList()
+  reconfigureKeymap(refreshKeymap())
+}, { deep: true, immediate: true })
+
+watch(layoutMode, (nextLayoutMode, previousLayoutMode) => {
+  closePreviewSearchBar()
+  syncLayoutControllers()
+  destroySplitLayout()
+
+  const previewWasVisible = previousLayoutMode?.columnOrder?.includes('preview') === true
+  const previewNowVisible = nextLayoutMode.columnOrder.includes('preview')
+  if (previewNowVisible !== true) {
+    pendingPreviewResyncAfterRefresh.value = false
+  } else if (previewWasVisible !== true) {
+    // 预览重新挂载后的首轮重同步只能由 refreshComplete 消费；
+    // 在预览仍未完成刷新前，即使继续发生布局变化，也必须保留这次待执行标记。
+    pendingPreviewResyncAfterRefresh.value = true
+  }
+
+  if (previewController.value !== true) {
+    pendingPreviewResyncAfterRefresh.value = false
+    clearLinkedHighlightDisplay()
+  }
+
+  nextTick(() => {
+    resetSplitLayout()
+    if (previewController.value !== true) {
+      return
+    }
+
+    if (pendingPreviewResyncAfterRefresh.value === true) {
+      return
+    }
+
+    syncEditorToPreview(true)
+    restorePreviewLinkedHighlight()
+  })
+})
+
+onMounted(() => {
+  menuVisible.value = store.config.menuVisible
+  previewSearchTargetBridge.activate()
+  syncLayoutControllers()
+  nextTick(() => {
+    resetSplitLayout()
+  })
+
+  initEditor({
+    doc: props.modelValue,
+    theme: props.theme,
+    extensionOptions: props.extension,
+    keymapList: refreshKeymap(),
+    extraExtensions: [linkedSourceHighlightField],
+    onDocChange: scheduleModelSync,
+    onSelectionChange: (update) => {
+      if (isPointerSelectionUpdate(update)) {
+        return
+      }
+      // 组合输入期间完全跳过联动高亮，避免输入法仍在占用 DOM 时再触发额外读写。
+      if (isCompositionActive() === true) {
+        return
+      }
+      // 普通输入会同时带来 docChanged + selectionSet。
+      // 这类原生输入尚未稳定时，只刷新预览侧联动高亮；
+      // 编辑区装饰统一延后到正文上浮阶段补做一次，避免在 DOMObserver 仍处理输入变更时追加第二次编辑器事务。
+      if (update.docChanged === true) {
+        highlightByEditorCursor(update.state, { previewOnly: true })
+        return
+      }
+      highlightByEditorCursor(update.state)
+    },
+    onCompositionIdle: () => {
+      const handledExternalSync = flushPendingExternalSync()
+      if (handledExternalSync !== true) {
+        scheduleModelSync()
+      }
+      highlightByEditorCursor()
+    },
+    onPaste: (event, view) => {
+      const clipboardData = event.clipboardData
+      if (!clipboardData) {
+        return
+      }
+      pasteOrDrop(event, view, clipboardData.types, clipboardData.files)
+    },
+    onClick: (view) => {
+      if (isCompositionActive() === true) {
+        return
+      }
+      highlightByEditorCursor(view.state)
+    },
+    onDrop: (event, view) => {
+      const dataTransfer = event.dataTransfer
+      if (!dataTransfer) {
+        return
+      }
+      pasteOrDrop(event, view, dataTransfer.types, dataTransfer.files)
+    },
+  })
+
+  nextTick(() => {
+    flushPendingExternalSync()
+    bindEvents()
+    if (props.associationHighlight === true) {
+      highlightByEditorCursor()
+    }
+  })
+})
+
+onActivated(() => {
+  previewSearchTargetBridge.activate()
+  closePreviewSearchBar()
+  nextTick(() => {
+    flushPendingExternalSync()
+  })
+})
+
+onDeactivated(() => {
+  modelSyncScheduler.cancel()
+  cancelPendingViewScrollRestore()
+  closePreviewSearchBar()
+  previewSearchTargetBridge.deactivate()
+})
+
+onBeforeUnmount(() => {
+  modelSyncScheduler.cancel()
+  cancelPendingViewScrollRestore()
+  closePreviewSearchBar()
+  previewSearchTargetBridge.deactivate({ preserveCleanupTarget: false })
+  cancelScheduledCursorHighlight()
+  clearAllLinkedHighlight()
+  unbindEvents()
+  clearScrollTimer()
+  destroySplitLayout()
+  destroyEditor()
+  pendingExternalSync.value = null
+})
+
+defineExpose({
+  flushPendingModelSync,
+  hasPendingModelSync,
+  captureViewScrollAnchors,
+  scheduleRestoreForCurrentSnapshot,
+  cancelPendingViewScrollRestore,
 })
 </script>
 
@@ -1075,57 +1201,166 @@ const editorContainerClass = computed(() => {
   <div
     class="grid grid-rows-[auto_1fr] grid-cols-1 h-full w-full"
   >
-    <div
-      class="w-full flex flex-wrap items-center justify-start flex-gap2 border-b-1 border-t-1 border-b-border-primary border-t-border-primary border-b-solid border-t-solid p-1"
-    >
-      <IconButton
-        v-for="(item, index) in toolbarList" :key="index" :icon="item.icon"
-        :label="item.label"
-        :shortcut-key="item.shortcutKey"
-        :menu-list="item.menuList"
-        :action="item.action"
-        :popover="item.popover"
-      />
-    </div>
-    <div ref="editorContainer" class="grid w-full overflow-hidden" :class="editorContainerClass" :style="gridAnimation ? 'transition: grid-template-columns 0.5s ease-in-out;' : ''">
-      <div ref="editorRef" class="h-full overflow-auto" />
-      <div v-if="previewController" ref="gutterRef" class="h-full cursor-col-resize bg-[#E2E2E2] op-0" />
-      <div
-        v-if="previewController"
-        ref="previewRef"
-        class="allow-search wj-scrollbar h-full p-2"
-        :class="menuController ? 'overflow-y-scroll' : 'overflow-y-auto'"
-        @scroll="syncPreviewToEditor"
-      >
-        <MarkdownPreview :content="props.modelValue" :code-theme="codeTheme" :preview-theme="previewTheme" :watermark="watermark" @anchor-change="onAnchorChange" @image-contextmenu="onImageContextmenu" />
-      </div>
-      <div v-if="menuController && previewController" ref="gutterMenuRef" class="h-full cursor-col-resize bg-[#E2E2E2] op-0" />
-      <MarkdownMenu v-if="menuController && previewController" :anchor-list="anchorList" :get-container="() => previewRef" :close="() => { menuVisible = false }" class="allow-search" />
-    </div>
-    <a-modal v-model:open="imageNetworkModel" title="网络图片" ok-text="确定" cancel-text="取消" centered destroy-on-close @ok="onInsertImgNetwork">
-      <a-form
-        :model="imageNetworkData"
-        :rules="imageNetworkDataRules"
-        autocomplete="off"
-        :label-col="{ span: 4 }"
-      >
-        <a-form-item
-          label="名称"
-          name="name"
+    <EditorToolbar :toolbar-list="toolbarList" />
+    <div ref="editorContainer" data-testid="markdown-edit-layout" class="markdown-edit-layout grid w-full overflow-hidden" :class="editorContainerClass" :style="editorContainerStyle">
+      <template v-for="item in layoutRenderItems" :key="item.key">
+        <div
+          v-if="item.type === 'editor'"
+          :ref="setEditorElement"
+          data-layout-item="editor"
+          class="markdown-edit-layout__editor h-full overflow-auto"
+        />
+        <div
+          v-else-if="item.type === 'gutter-preview'"
+          :ref="setPreviewGutterElement"
+          data-layout-item="gutter-preview"
+          class="markdown-edit-layout__gutter markdown-edit-layout__gutter--preview wj-sash wj-sash--vertical h-full"
+        />
+        <div
+          v-else-if="item.type === 'preview'"
+          :ref="setPreviewElement"
+          data-layout-item="preview"
+          class="wj-scrollbar allow-search markdown-edit-layout__preview h-full overflow-y-auto p-2"
+          :style="previewContainerStyle"
+          @scroll="syncPreviewToEditor"
+          @click="onPreviewAreaClick"
         >
-          <a-input v-model:value="imageNetworkData.name" />
-        </a-form-item>
-        <a-form-item
-          label="链接"
-          name="url"
-        >
-          <a-input v-model:value="imageNetworkData.url" />
-        </a-form-item>
-      </a-form>
-    </a-modal>
-    <EditorSearchBar v-if="editorSearchBarVisible" :editor-view="editorView" @close="onEditorSearchBarClose" />
+          <MarkdownPreview
+            :content="props.modelValue"
+            :code-theme="codeTheme"
+            :preview-theme="previewTheme"
+            :preview-scroll-container="() => previewRef"
+            :watermark="watermark"
+            @refresh-complete="onRefreshComplete"
+            @anchor-change="onAnchorChange"
+            @preview-contextmenu="onPreviewContextmenu"
+            @asset-open="onAssetOpen"
+          />
+        </div>
+        <div
+          v-else-if="item.type === 'gutter-menu'"
+          :ref="setMenuGutterElement"
+          data-layout-item="gutter-menu"
+          class="markdown-edit-layout__gutter wj-sash wj-sash--vertical markdown-edit-layout__gutter--menu h-full"
+        />
+        <MarkdownMenu
+          v-else-if="item.type === 'menu'"
+          :anchor-list="anchorList"
+          :get-container="() => previewRef"
+          :close="() => { menuVisible = false }"
+          :show-header="false"
+          data-layout-item="menu"
+          class="allow-search markdown-edit-layout__menu"
+          @anchor-navigate="onOutlineNavigate"
+        />
+      </template>
+    </div>
+
+    <ImageNetworkModal
+      v-model:open="imageNetworkModel"
+      :form-data="imageNetworkData"
+      :form-rules="imageNetworkDataRules"
+      @update:name="(value) => { imageNetworkData.name = value }"
+      @update:url="(value) => { imageNetworkData.url = value }"
+      @ok="onInsertNetworkImage"
+    />
+
+    <EditorSearchBar
+      v-if="editorSearchBarVisible"
+      :editor-view="editorView"
+      @close="onEditorSearchBarClose"
+    />
   </div>
 </template>
 
 <style scoped lang="scss">
+.markdown-edit-layout__editor {
+  grid-area: editor;
+  min-width: 0;
+}
+
+.markdown-edit-layout__preview {
+  grid-area: preview;
+  min-width: 0;
+}
+
+.markdown-edit-layout__menu {
+  grid-area: menu;
+  min-width: 0;
+}
+
+.markdown-edit-layout__gutter--preview {
+  grid-area: gutter-preview;
+}
+
+.markdown-edit-layout__gutter--menu {
+  grid-area: gutter-menu;
+}
+
+.markdown-edit-layout--editor-only {
+  // split-grid 只能解析 px / fr / % / auto，不能直接吃 minmax(...)。
+  grid-template-columns: 1fr 0px 0fr 0px 0fr;
+  grid-template-areas: 'editor gutter-preview preview gutter-menu menu';
+}
+
+.markdown-edit-layout--editor-preview {
+  grid-template-columns: 1fr 1px 1fr 0px 0fr;
+  grid-template-areas: 'editor gutter-preview preview gutter-menu menu';
+}
+
+.markdown-edit-layout--editor-preview-menu {
+  grid-template-columns: 1fr 1px 1fr 1px 0.4fr;
+  grid-template-areas: 'editor gutter-preview preview gutter-menu menu';
+}
+
+.markdown-edit-layout--preview-editor {
+  grid-template-columns: 1fr 1px 1fr 0px 0fr;
+  grid-template-areas: 'preview gutter-preview editor gutter-menu menu';
+}
+
+.markdown-edit-layout--menu-preview-editor {
+  grid-template-columns: 0.4fr 1px 1fr 1px 1fr;
+  grid-template-areas: 'menu gutter-menu preview gutter-preview editor';
+}
+
+:deep(.wj-preview-link-highlight) {
+  border-radius: var(--wj-link-highlight-radius);
+  // background-color: var(--wj-link-highlight-bg);
+  outline: var(--wj-link-highlight-width) solid var(--wj-link-highlight-border);
+  //outline-offset: var(--wj-link-highlight-width);
+}
+
+:deep(.cm-linked-source-highlight) {
+  // background-color: var(--wj-link-highlight-bg);
+  box-shadow:
+    inset var(--wj-link-highlight-width) 0 0 var(--wj-link-highlight-border),
+    inset calc(var(--wj-link-highlight-width) * -1) 0 0 var(--wj-link-highlight-border);
+}
+
+:deep(.cm-linked-source-highlight-start) {
+  border-top-left-radius: var(--wj-link-highlight-radius);
+  border-top-right-radius: var(--wj-link-highlight-radius);
+  box-shadow:
+    inset var(--wj-link-highlight-width) 0 0 var(--wj-link-highlight-border),
+    inset calc(var(--wj-link-highlight-width) * -1) 0 0 var(--wj-link-highlight-border),
+    inset 0 var(--wj-link-highlight-width) 0 var(--wj-link-highlight-border);
+}
+
+:deep(.cm-linked-source-highlight-end) {
+  border-bottom-left-radius: var(--wj-link-highlight-radius);
+  border-bottom-right-radius: var(--wj-link-highlight-radius);
+  box-shadow:
+    inset var(--wj-link-highlight-width) 0 0 var(--wj-link-highlight-border),
+    inset calc(var(--wj-link-highlight-width) * -1) 0 0 var(--wj-link-highlight-border),
+    inset 0 calc(var(--wj-link-highlight-width) * -1) 0 var(--wj-link-highlight-border);
+}
+
+:deep(.cm-linked-source-highlight-single) {
+  border-radius: var(--wj-link-highlight-radius);
+  box-shadow:
+    inset var(--wj-link-highlight-width) 0 0 var(--wj-link-highlight-border),
+    inset calc(var(--wj-link-highlight-width) * -1) 0 0 var(--wj-link-highlight-border),
+    inset 0 var(--wj-link-highlight-width) 0 var(--wj-link-highlight-border),
+    inset 0 calc(var(--wj-link-highlight-width) * -1) 0 var(--wj-link-highlight-border);
+}
 </style>

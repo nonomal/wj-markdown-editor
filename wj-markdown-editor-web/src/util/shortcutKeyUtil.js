@@ -1,5 +1,12 @@
 import router from '@/router/index.js'
+import { useCommonStore } from '@/stores/counter.js'
 import channelUtil from '@/util/channel/channelUtil.js'
+import { requestDocumentOpenByDialogAndOpen } from '@/util/document-session/documentOpenInteractionService.js'
+import {
+  requestDocumentSave,
+  requestDocumentSaveCopy,
+} from '@/util/document-session/rendererDocumentCommandUtil.js'
+import toggleFullScreenAction from '@/util/fullScreenActionUtil.js'
 
 /**
  * 按键映射 与codemirror的快捷键映射规则保持一致
@@ -89,12 +96,29 @@ const keyMappings = {
   Pause: 'Pause',
 }
 
+const functionKeyCodePattern = /^F(?:[1-9]|1[0-2])$/
+
+function toggleFileManagerPanelAction() {
+  const store = useCommonStore()
+  const nextVisible = !store.fileManagerPanelVisible
+
+  if (typeof store.setFileManagerPanelVisible === 'function') {
+    store.setFileManagerPanelVisible(nextVisible)
+    return
+  }
+
+  store.fileManagerPanelVisible = nextVisible
+}
+
 const webShortcutKeyHandler = {
   createNew: () => {
     channelUtil.send({ event: 'create-new' }).then(() => {})
   },
   openFile: () => {
-    channelUtil.send({ event: 'open-file' }).then(() => {})
+    requestDocumentOpenByDialogAndOpen({
+      entrySource: 'shortcut-open-file',
+      trigger: 'user',
+    }).then(() => {})
   },
   switchView: () => {
     if (router.currentRoute.value.name === 'editor') {
@@ -104,14 +128,16 @@ const webShortcutKeyHandler = {
     }
   },
   save: () => {
-    channelUtil.send({ event: 'save' }).then(() => {})
+    requestDocumentSave().then(() => {})
   },
   saveOther: () => {
-    channelUtil.send({ event: 'save-other' }).then(() => {})
+    requestDocumentSaveCopy().then(() => {})
   },
   setting: () => {
     channelUtil.send({ event: 'open-setting' }).then(() => {})
   },
+  toggleFullScreen: toggleFullScreenAction,
+  toggleFileManagerPanel: toggleFileManagerPanelAction,
 }
 
 /**
@@ -190,6 +216,10 @@ function getShortcutKey(e) {
  */
 function isShortcutKey(e) {
   // 排除只按下修饰键的情况 排除非组合键的情况（shift不能单独使用）
+  if (functionKeyCodePattern.test(e.code)) {
+    return true
+  }
+
   return !(['ControlLeft', 'ControlRight', 'ShiftLeft', 'ShiftRight', 'AltLeft', 'AltRight', 'MetaLeft', 'MetaRight'].includes(e.code) || (!e.ctrlKey
     && !e.altKey && !e.metaKey))
 }

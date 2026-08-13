@@ -1,9 +1,18 @@
 <script setup>
-import { useCommonStore } from '@/stores/counter.js'
-import md from '@/util/markdown-it/markdownItDefault.js'
+import { message } from 'ant-design-vue'
 import mermaid from 'mermaid'
-import { onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { onBeforeRouteLeave } from 'vue-router'
+import { shouldReplaceElementBeforeAttributeSync } from '@/components/editor/markdownPreviewDomPatchUtil.js'
+import { useCommonStore } from '@/stores/counter.js'
+import { syncCodeBlockActionVariables } from '@/util/codeBlockActionStyleUtil.js'
+import { loadCodeTheme } from '@/util/codeThemeUtil.js'
+import { handlePreviewHashAnchorClick } from '@/util/editor/previewAnchorLinkScrollUtil.js'
+import { createPreviewResourceContext } from '@/util/editor/previewResourceContextUtil.js'
+import md from '@/util/markdown-it/markdownItDefault.js'
+import { copyTextWithFeedback, getPreviewInlineCodeCopyText, syncPreviewInlineCodeCopyMetadata } from '@/util/previewInlineCodeCopyUtil.js'
+import { settleMermaidRender } from '@/util/previewMermaidRenderUtil.js'
 
 const props = defineProps({
   content: {
@@ -16,73 +25,527 @@ const props = defineProps({
   },
   previewTheme: {
     type: String,
-    default: () => 'github-light',
+    default: () => 'github',
   },
   watermark: {
     type: Object,
     default: () => null,
   },
+  previewScrollContainer: {
+    type: Function,
+    default: () => null,
+  },
+  manageHtmlImageResources: {
+    type: Boolean,
+    default: () => true,
+  },
 })
 
-const emits = defineEmits(['refreshComplete', 'anchorChange', 'imageContextmenu'])
+const emits = defineEmits(['refreshComplete', 'anchorChange', 'previewContextmenu', 'assetOpen'])
+
+const store = useCommonStore()
+const { t } = useI18n()
+const previewShellRef = ref()
+
+/**
+ * 根据全局主题获取 mermaid 主题
+ * @param {string} globalTheme - 全局主题 'light' 或 'dark'
+ * @returns {string} mermaid 主题
+ */
+function getMermaidTheme(globalTheme) {
+  return globalTheme === 'dark' ? 'dark' : 'default'
+}
+
+/**
+ * 初始化 mermaid 配置
+ */
+function initMermaid() {
+  const theme = getMermaidTheme(store.config.theme.global)
+  mermaid.initialize({
+    startOnLoad: false,
+    theme,
+    securityLevel: 'loose',
+  })
+}
 
 const previewRef = ref()
+
+const previewShellStyle = computed(() => ({
+  'fontFamily': 'var(--preview-area-font)',
+  // 在样式层完成新旧变量名桥接，避免把兼容逻辑扩散到 helper 内部。
+  '--wj-code-block-action-color': 'var(--wj-code-block-action-fg-muted)',
+  '--wj-code-block-action-focus-color': 'var(--wj-code-block-action-fg)',
+  '--wj-code-block-action-border-color': 'var(--wj-code-block-action-border)',
+  '--wj-code-block-action-focus-border-color': 'var(--wj-code-block-action-border)',
+  '--wj-code-block-action-background': 'var(--wj-code-block-action-bg)',
+  '--wj-code-block-action-focus-background': 'var(--wj-code-block-action-bg)',
+  '--wj-preview-image-box-shadow': store.config.markdown?.imageShadow === false ? 'none' : 'var(--img-box-shadow)',
+}))
 
 const imageSrcList = ref([])
 const imagePreviewVisible = ref(false)
 const imagePreviewCurrentIndex = ref(0)
+const pendingContent = ref(props.content)
 
-function onImageClick(e) {
-  const index = Number(e.target.dataset.index)
-  imagePreviewVisible.value = true
-  imagePreviewCurrentIndex.value = index
+const PREVIEW_THROTTLE_MS = 180
+let previewRefreshRafId = null
+let previewRefreshTimer = null
+let lastPreviewRefreshAt = 0
+let previewRefreshSequence = 0
+// keep-alive 失活时不能再继续对缓存 DOM 做 mermaid 渲染。
+// 否则 mermaid 在读取几何信息时会命中已经脱离当前活动视图的节点。
+let previewViewActive = false
+let pendingActivationRefresh = false
+let pendingActivationForceMermaidRefresh = false
+let pendingActivationMermaidInit = false
+let activationRefreshTaskToken = 0
+
+function createRafTask(callback) {
+  if (typeof requestAnimationFrame === 'function') {
+    return requestAnimationFrame(callback)
+  }
+  return setTimeout(callback, 16)
 }
 
-function onImageContextmenu(e) {
-  const src = e.target.src
-  emits('imageContextmenu', src)
+function cancelRafTask(id) {
+  if (typeof cancelAnimationFrame === 'function' && typeof requestAnimationFrame === 'function') {
+    cancelAnimationFrame(id)
+    return
+  }
+  clearTimeout(id)
+}
+
+function clearPreviewRefreshScheduler() {
+  if (previewRefreshRafId !== null) {
+    cancelRafTask(previewRefreshRafId)
+    previewRefreshRafId = null
+  }
+  if (previewRefreshTimer !== null) {
+    clearTimeout(previewRefreshTimer)
+    previewRefreshTimer = null
+  }
 }
 
 /**
- * 添加图片点击事件
+ * 判断当前是否还有尚未执行的预览刷新调度。
+ *
+ * @returns {boolean} 只要 RAF 或节流定时器仍在排队，就视为存在待补做刷新。
  */
-function addImageListener() {
+function hasScheduledPreviewRefresh() {
+  return previewRefreshRafId !== null || previewRefreshTimer !== null
+}
+
+/**
+ * 仅允许当前激活中的预览实例继续执行 DOM 刷新。
+ * keep-alive 失活页即使还保留响应式监听，也必须把刷新延迟到重新激活后。
+ *
+ * @returns {boolean} 当前预览实例是否允许立即刷新 DOM。
+ */
+function canRefreshPreviewNow() {
+  return previewViewActive === true && previewRef.value instanceof HTMLElement
+}
+
+/**
+ * 记录失活期间积压的预览刷新诉求，统一在重新激活后补做一次。
+ *
+ * @param {{ forceRefreshMermaid?: boolean, reinitMermaid?: boolean }} options
+ */
+function markPendingActivationRefresh(options = {}) {
+  pendingActivationRefresh = true
+  pendingActivationForceMermaidRefresh = pendingActivationForceMermaidRefresh || options.forceRefreshMermaid === true
+  pendingActivationMermaidInit = pendingActivationMermaidInit || options.reinitMermaid === true
+}
+
+function consumePendingActivationRefresh() {
+  const activationTask = {
+    needsRefresh: pendingActivationRefresh,
+    forceRefreshMermaid: pendingActivationForceMermaidRefresh,
+    reinitMermaid: pendingActivationMermaidInit,
+  }
+
+  pendingActivationRefresh = false
+  pendingActivationForceMermaidRefresh = false
+  pendingActivationMermaidInit = false
+
+  return activationTask
+}
+
+/**
+ * keep-alive 恢复时需要先让父页面完成 snapshot 重放，
+ * 再决定是否补做预览刷新；否则会先按旧 props.content 闪回一帧。
+ *
+ * @param {{ needsRefresh?: boolean, forceRefreshMermaid?: boolean, reinitMermaid?: boolean }} activationTask
+ */
+function scheduleActivationRefresh(activationTask = {}) {
+  if (activationTask.needsRefresh !== true && activationTask.reinitMermaid !== true) {
+    return
+  }
+
+  const taskToken = ++activationRefreshTaskToken
+  nextTick(() => {
+    if (taskToken !== activationRefreshTaskToken) {
+      return
+    }
+    if (!canRefreshPreviewNow()) {
+      markPendingActivationRefresh({
+        forceRefreshMermaid: activationTask.forceRefreshMermaid,
+        reinitMermaid: activationTask.reinitMermaid,
+      })
+      return
+    }
+    if (activationTask.reinitMermaid === true) {
+      initMermaid()
+    }
+    if (activationTask.needsRefresh === true) {
+      refreshPreviewImmediately(props.content, activationTask.forceRefreshMermaid)
+    }
+  })
+}
+
+/**
+ * 将当前代码主题派生出的结构层变量同步到预览壳节点。
+ */
+function refreshCodeBlockActionVariables() {
+  syncCodeBlockActionVariables(previewShellRef.value)
+}
+
+/**
+ * 从 DOM 上读取可稳定回放的 Markdown 原始引用元信息。
+ * 当前 markdown-it 尚未稳定产出这组元信息时，这里必须回退为 null，禁止伪造引用文本。
+ * @param {Element} assetDom - 当前命中的资源节点
+ * @returns {string | null} Markdown 原始引用文本
+ */
+function getMarkdownReferenceFromDom(assetDom) {
+  const candidateList = [
+    assetDom.dataset.wjMarkdownReference,
+    assetDom.dataset.wjResourceMarkdownReference,
+  ]
+
+  for (const candidate of candidateList) {
+    if (typeof candidate === 'string' && candidate) {
+      return candidate
+    }
+  }
+
+  return null
+}
+
+function getAssetInfoFromDom(assetDom, event) {
+  const resourceUrl = assetDom.getAttribute('src') || assetDom.getAttribute('href') || ''
+  const rawSrc = assetDom.dataset.wjResourceSrc
+  const rawPath = assetDom.dataset.wjResourceRaw || rawSrc
+  const kind = assetDom.dataset.wjResourceKind
+  if (!resourceUrl || !rawSrc || !kind) {
+    return null
+  }
+  const lineDom = assetDom.closest('[data-line-start]')
+  const occurrence = Number.parseInt(assetDom.dataset.wjResourceOccurrence || '1', 10)
+  return {
+    kind,
+    assetType: kind,
+    rawSrc,
+    rawPath,
+    resourceUrl,
+    markdownReference: getMarkdownReferenceFromDom(assetDom),
+    occurrence: Number.isNaN(occurrence) ? 1 : occurrence,
+    lineStart: lineDom?.dataset.lineStart ? Number.parseInt(lineDom.dataset.lineStart, 10) : undefined,
+    lineEnd: lineDom?.dataset.lineEnd ? Number.parseInt(lineDom.dataset.lineEnd, 10) : undefined,
+    clientX: event?.clientX,
+    clientY: event?.clientY,
+  }
+}
+
+/**
+ * 统一处理预览区点击事件（事件委托）
+ */
+function handlePreviewClick(e) {
+  if (!(e.target instanceof Element)) {
+    return
+  }
+
+  // 处理图片点击
+  const img = e.target.closest('img')
+  if (img) {
+    const index = Number(img.dataset.index)
+    imagePreviewVisible.value = true
+    imagePreviewCurrentIndex.value = index
+    return
+  }
+
+  const assetLink = e.target.closest('a[data-wj-resource-src][data-wj-resource-kind="link"]')
+  if (assetLink instanceof Element) {
+    const assetInfo = getAssetInfoFromDom(assetLink, e)
+    const context = assetInfo ? createPreviewResourceContext(assetInfo) : null
+    if (assetInfo?.resourceUrl && context?.asset?.sourceType === 'local') {
+      e.preventDefault()
+      emits('assetOpen', assetInfo)
+      return
+    }
+  }
+
+  // 处理脚注链接点击
+  const footnoteLink = e.target.closest('.footnote-ref a, .footnote-backref')
+  if (footnoteLink) {
+    const href = footnoteLink.getAttribute('href')
+    if (!href || !href.startsWith('#'))
+      return
+
+    e.preventDefault()
+    const targetId = href.slice(1)
+    const targetElement = document.getElementById(targetId)
+    if (targetElement) {
+      targetElement.scrollIntoView({ block: 'center' })
+    }
+    return
+  }
+
+  const inlineCodeText = getPreviewInlineCodeCopyText({
+    enabled: store.config.markdown.inlineCodeClickCopy,
+    target: e.target,
+    selection: window.getSelection?.() || null,
+  })
+  if (inlineCodeText !== null) {
+    copyTextWithFeedback({
+      text: inlineCodeText,
+      writeText: async text => await navigator.clipboard.writeText(text),
+      onEmpty() {
+        message.warning(t('message.noCopyableContent'))
+      },
+      onSuccess() {
+        message.success(t('message.copySucceeded'))
+      },
+      onError() {
+        message.error(t('message.copyFailed'))
+      },
+    }).then(() => {})
+    return
+  }
+
+  if (handlePreviewHashAnchorClick({
+    event: e,
+    previewRoot: previewRef.value,
+    previewScrollContainer: props.previewScrollContainer,
+    // 统一在组件层处理提示，便于复用国际化文案与现有消息样式配置。
+    onTargetMissing: () => {
+      message.warning(t('message.anchorTargetDoesNotExist'))
+    },
+  })) {
+    return void 0
+  }
+}
+
+/**
+ * 统一处理预览区右键事件（事件委托）
+ */
+function handlePreviewContextmenu(e) {
+  if (!(e.target instanceof Element)) {
+    return
+  }
+  const assetDom = e.target.closest('img[data-wj-resource-src], video[data-wj-resource-src], audio[data-wj-resource-src], a[data-wj-resource-src]')
+  if (!(assetDom instanceof Element)) {
+    return
+  }
+  const assetInfo = getAssetInfoFromDom(assetDom, e)
+  if (!assetInfo) {
+    return
+  }
+  const context = createPreviewResourceContext(assetInfo)
+  if (!context) {
+    return
+  }
+  e.preventDefault()
+  emits('previewContextmenu', context)
+}
+
+/**
+ * 绑定预览区事件
+ */
+function bindPreviewEvents() {
+  previewRef.value?.addEventListener('click', handlePreviewClick)
+  previewRef.value?.addEventListener('contextmenu', handlePreviewContextmenu)
+}
+
+/**
+ * 解绑预览区事件
+ */
+function unbindPreviewEvents() {
+  previewRef.value?.removeEventListener('click', handlePreviewClick)
+  previewRef.value?.removeEventListener('contextmenu', handlePreviewContextmenu)
+}
+
+/**
+ * 更新预览区资源元数据
+ */
+function updatePreviewAssetMetadata() {
+  const imageDomList = previewRef.value.querySelectorAll('img')
   const srcList = []
-  const imageDomList = previewRef.value.querySelectorAll('img')
-  if (imageDomList.length > 0) {
-    for (let i = 0; i < imageDomList.length; i++) {
-      const item = imageDomList.item(i)
-      item.dataset.index = String(i)
-      item.style.cursor = 'pointer'
-      srcList.push(item.src)
-      item.addEventListener('click', onImageClick)
-      item.addEventListener('contextmenu', onImageContextmenu)
-    }
-  }
+  imageDomList.forEach((item, index) => {
+    item.dataset.index = String(index)
+    item.style.cursor = 'pointer'
+    srcList.push(item.src)
+  })
   imageSrcList.value = srcList
+
+  const assetOccurrenceMap = new Map()
+  const assetDomList = previewRef.value.querySelectorAll('img[data-wj-resource-src], video[data-wj-resource-src], audio[data-wj-resource-src], a[data-wj-resource-src]')
+  assetDomList.forEach((item) => {
+    const rawSrc = item.dataset.wjResourceSrc
+    const kind = item.dataset.wjResourceKind
+    if (!rawSrc || !kind) {
+      return
+    }
+    const mapKey = `${kind}:${rawSrc}`
+    const occurrence = (assetOccurrenceMap.get(mapKey) || 0) + 1
+    assetOccurrenceMap.set(mapKey, occurrence)
+    item.dataset.wjResourceOccurrence = String(occurrence)
+  })
 }
 
 /**
- * 移除图片点击事件
+ * 同步预览区行内代码复制交互 metadata。
  */
-function removeImageListener() {
-  const imageDomList = previewRef.value.querySelectorAll('img')
-  if (imageDomList.length > 0) {
-    for (let i = 0; i < imageDomList.length; i++) {
-      const item = imageDomList.item(i)
-      item.removeEventListener('click', onImageClick)
-      item.removeEventListener('contextmenu', onImageContextmenu)
-    }
-  }
+function updatePreviewInlineCodeCopyMetadata() {
+  syncPreviewInlineCodeCopyMetadata({
+    enabled: store.config.markdown.inlineCodeClickCopy,
+    previewRoot: previewRef.value,
+  })
 }
 
 const latestAnchorList = ref([])
+
+const OUTLINE_INLINE_TAG_NAME_SET = new Set([
+  'b',
+  'code',
+  'del',
+  'em',
+  'i',
+  'ins',
+  'mark',
+  's',
+  'strong',
+  'sub',
+  'sup',
+  'u',
+])
+
+const OUTLINE_TEXT_COLOR_SPAN_CLASS_NAME_SET = new Set([
+  'markdown-it-text-color',
+  'markdown-it-text-color-gradient',
+])
+
+function parseHeadingLineNumber(value) {
+  const numericValue = Number.parseInt(value || '', 10)
+  if (Number.isInteger(numericValue) !== true || numericValue <= 0) {
+    return undefined
+  }
+
+  return numericValue
+}
+
+/**
+ * 将文本节点转成可安全注入 v-html 的 HTML 片段。
+ * 这里只保留文本内容，不透传任意标签或属性。
+ *
+ * @param {string} value - 原始文本内容
+ * @returns {string} 经过 HTML 转义后的文本
+ */
+function escapeOutlineHeadingHtmlText(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+}
+
+/**
+ * 将属性值转义为安全的 HTML attribute 文本。
+ * 大纲只会回放项目内置白名单 span 的 class 和颜色变量，不允许直接透传原始属性串。
+ *
+ * @param {string} value - 原始属性值
+ * @returns {string} 转义后的属性值
+ */
+function escapeOutlineHeadingHtmlAttribute(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('"', '&quot;')
+    .replaceAll('\'', '&#39;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+}
+
+/**
+ * 递归提取标题中的受控行内富文本，仅保留允许进入大纲的语义标签，
+ * 以及项目内置文字颜色扩展生成的白名单 span。
+ * 这样既能复用预览区最终 DOM，又能避免把任意 HTML 原样透传到目录里。
+ *
+ * @param {Node} node - 当前待处理节点
+ * @returns {string} 清洗后的 HTML 片段
+ */
+function buildOutlineHeadingHtmlFromNode(node) {
+  if (!(node instanceof Node)) {
+    return ''
+  }
+
+  if (node.nodeType === Node.TEXT_NODE) {
+    return escapeOutlineHeadingHtmlText(node.textContent)
+  }
+
+  if (node.nodeType !== Node.ELEMENT_NODE) {
+    return ''
+  }
+
+  const element = /** @type {HTMLElement} */ (node)
+  const tagName = element.tagName.toLowerCase()
+  if (tagName === 'img') {
+    return escapeOutlineHeadingHtmlText(element.getAttribute('alt') || '')
+  }
+  if (tagName === 'br') {
+    return ' '
+  }
+
+  const childHtml = Array.from(element.childNodes)
+    .map(childNode => buildOutlineHeadingHtmlFromNode(childNode))
+    .join('')
+
+  if (tagName === 'span') {
+    const className = Array.from(element.classList)
+      .find(candidateClassName => OUTLINE_TEXT_COLOR_SPAN_CLASS_NAME_SET.has(candidateClassName))
+    const textColorValue = element.style.getPropertyValue('--markdown-it-text-color').trim()
+
+    if (className && textColorValue) {
+      const escapedClassName = escapeOutlineHeadingHtmlAttribute(className)
+      const escapedTextColorValue = escapeOutlineHeadingHtmlAttribute(textColorValue)
+      return `<span class="${escapedClassName}" style="--markdown-it-text-color: ${escapedTextColorValue}">${childHtml}</span>`
+    }
+  }
+
+  if (OUTLINE_INLINE_TAG_NAME_SET.has(tagName)) {
+    return `<${tagName}>${childHtml}</${tagName}>`
+  }
+
+  return childHtml
+}
+
+/**
+ * 提取标题节点在大纲中展示用的受控富文本。
+ *
+ * @param {Element} heading - 预览区标题节点
+ * @returns {string} 清洗后的标题 HTML
+ */
+function buildOutlineHeadingHtml(heading) {
+  if (!(heading instanceof Element)) {
+    return ''
+  }
+
+  return Array.from(heading.childNodes)
+    .map(node => buildOutlineHeadingHtmlFromNode(node))
+    .join('')
+}
 
 /**
  * 解析大纲并推送
  */
 function pushAnchorList() {
-  const headings = Array.from(document.querySelectorAll('h1, h2, h3, h4, h5, h6'))
+  const headings = Array.from(previewRef.value?.querySelectorAll?.('h1, h2, h3, h4, h5, h6') || [])
   const tree = []
   const stack = [{ children: tree }] // 根节点栈
 
@@ -91,7 +554,10 @@ function pushAnchorList() {
       key: heading.id,
       href: `#${heading.id}`,
       title: heading.textContent,
+      titleHtml: buildOutlineHeadingHtml(heading),
       level: Number.parseInt(heading.tagName[1]),
+      lineStart: parseHeadingLineNumber(heading.dataset.lineStart),
+      lineEnd: parseHeadingLineNumber(heading.dataset.lineEnd),
       children: [],
     }
 
@@ -129,6 +595,12 @@ function updateDOM(oldNode, newNode) {
     return
   }
 
+  if (shouldReplaceElementBeforeAttributeSync(oldNode, newNode)) {
+    const clonedNewNode = newNode.cloneNode(true)
+    oldNode.replaceWith(clonedNewNode)
+    return
+  }
+
   // 元素节点属性比对
   const oldAttributes = oldNode.attributes
   const newAttributes = newNode.attributes
@@ -149,7 +621,15 @@ function updateDOM(oldNode, newNode) {
   // 设置/更新属性
   for (const { name, value } of newAttributes) {
     if (oldNode.getAttribute(name) !== value) {
-      oldNode.setAttribute(name, value)
+      try {
+        oldNode.setAttribute(name, value)
+      } catch {
+        // 某些原生元素在属性更新过程中会立刻触发浏览器内建校验，
+        // 一旦出现真实异常，直接整节点替换能避免保留半更新状态。
+        const clonedNewNode = newNode.cloneNode(true)
+        oldNode.replaceWith(clonedNewNode)
+        return
+      }
     }
   }
 
@@ -181,49 +661,159 @@ function updateDOM(oldNode, newNode) {
   }
 }
 
-watch(() => useCommonStore().config.markdown.typographer, (newValue) => {
+watch(() => store.config.markdown.typographer, (newValue) => {
   md.set({ typographer: newValue })
-  refreshPreview(props.content)
+  refreshPreviewImmediately(props.content)
 })
 
-function refreshPreview(doc) {
-  removeImageListener()
-  let shouldRefreshMermaid = false
-  const rendered = md.render(doc)
+watch(() => store.config.theme.global, () => {
+  if (!canRefreshPreviewNow()) {
+    markPendingActivationRefresh({
+      forceRefreshMermaid: true,
+      reinitMermaid: true,
+    })
+    return
+  }
+  initMermaid()
+  refreshPreviewImmediately(props.content, true)
+})
+
+watch(() => store.config.markdown.inlineCodeClickCopy, () => {
+  updatePreviewInlineCodeCopyMetadata()
+})
+
+// 监听 codeTheme 变化，动态加载主题 CSS
+watch(() => props.codeTheme, async (newTheme) => {
+  if (newTheme) {
+    await loadCodeTheme(newTheme)
+    refreshCodeBlockActionVariables()
+  }
+}, { immediate: true })
+
+async function refreshPreview(doc, forceRefreshMermaid = false) {
+  const currentRefreshSequence = ++previewRefreshSequence
+  let shouldRefreshMermaid = forceRefreshMermaid
+  const rendered = md.render(doc, {
+    manageHtmlImageResources: props.manageHtmlImageResources,
+  })
   const tempElement = document.createElement('div')
   tempElement.innerHTML = rendered
-  tempElement.querySelectorAll('.mermaid').forEach((mermaidElement) => {
-    const mermaidNode = previewRef.value.querySelector(`[data-code='${mermaidElement.dataset.code}']`)
-    if (mermaidNode) {
-      mermaidElement.classList.replace('mermaid', 'mermaid-cache')
-      mermaidElement.innerHTML = mermaidNode.innerHTML
-    } else {
-      shouldRefreshMermaid = true
-    }
-  })
+  if (!forceRefreshMermaid) {
+    tempElement.querySelectorAll('.mermaid').forEach((mermaidElement) => {
+      // 强制刷新时跳过缓存复用
+      const mermaidNode = previewRef.value.querySelector(`[data-code='${mermaidElement.dataset.code}']`)
+      if (mermaidNode) {
+        mermaidElement.classList.replace('mermaid', 'mermaid-cache')
+        mermaidElement.innerHTML = mermaidNode.innerHTML
+      } else {
+        shouldRefreshMermaid = true
+      }
+    })
+  }
   // 使用临时元素来更新，防止一些attribute没有映射到property上
   updateDOM(previewRef.value, tempElement)
 
-  // const checkboxList = previewRef.value.querySelectorAll('input[type=checkbox]')
-  // for (const checkboxListElement of checkboxList) {
-  //   if (checkboxListElement.getAttribute('checked') !== null) {
-  //     checkboxListElement.checked = true
-  //   }
-  // }
-  if (shouldRefreshMermaid) {
-    mermaid.run()
+  await settleMermaidRender({
+    nodes: shouldRefreshMermaid ? previewRef.value.querySelectorAll('.mermaid') : [],
+    runMermaid: options => mermaid.run(options),
+    logError: (message, error) => {
+      console.error(message, error)
+    },
+  })
+  if (currentRefreshSequence !== previewRefreshSequence) {
+    return
   }
-  addImageListener()
+  refreshCodeBlockActionVariables()
+  updatePreviewAssetMetadata()
+  updatePreviewInlineCodeCopyMetadata()
   pushAnchorList()
   emits('refreshComplete')
 }
 
+function refreshPreviewImmediately(doc, forceRefreshMermaid = false) {
+  clearPreviewRefreshScheduler()
+  pendingContent.value = doc
+  if (!canRefreshPreviewNow()) {
+    markPendingActivationRefresh({
+      forceRefreshMermaid,
+    })
+    return
+  }
+  refreshPreview(doc, forceRefreshMermaid).then(() => {})
+  lastPreviewRefreshAt = Date.now()
+}
+
+function flushScheduledPreviewRefresh() {
+  previewRefreshRafId = null
+  const remainingMs = PREVIEW_THROTTLE_MS - (Date.now() - lastPreviewRefreshAt)
+
+  if (remainingMs <= 0) {
+    refreshPreview(pendingContent.value).then(() => {})
+    lastPreviewRefreshAt = Date.now()
+    return
+  }
+
+  if (previewRefreshTimer !== null) {
+    clearTimeout(previewRefreshTimer)
+  }
+  previewRefreshTimer = setTimeout(() => {
+    previewRefreshTimer = null
+    refreshPreview(pendingContent.value).then(() => {})
+    lastPreviewRefreshAt = Date.now()
+  }, remainingMs)
+}
+
+function schedulePreviewRefresh(doc) {
+  pendingContent.value = doc
+  if (!canRefreshPreviewNow()) {
+    markPendingActivationRefresh()
+    return
+  }
+
+  if (previewRefreshRafId !== null || previewRefreshTimer !== null) {
+    return
+  }
+  previewRefreshRafId = createRafTask(() => {
+    flushScheduledPreviewRefresh()
+  })
+}
+
 watch(() => props.content, (newValue) => {
-  refreshPreview(newValue)
+  schedulePreviewRefresh(newValue)
+})
+
+watch(() => store.externalFileChange.visible, (visible) => {
+  if (visible) {
+    imagePreviewVisible.value = false
+  }
 })
 
 onMounted(() => {
-  refreshPreview(props.content)
+  previewViewActive = true
+  initMermaid()
+  bindPreviewEvents()
+  refreshPreviewImmediately(props.content)
+})
+
+onActivated(() => {
+  previewViewActive = true
+  scheduleActivationRefresh(consumePendingActivationRefresh())
+})
+
+onDeactivated(() => {
+  activationRefreshTaskToken += 1
+  if (hasScheduledPreviewRefresh()) {
+    markPendingActivationRefresh()
+  }
+  previewViewActive = false
+  clearPreviewRefreshScheduler()
+})
+
+onBeforeUnmount(() => {
+  activationRefreshTaskToken += 1
+  previewViewActive = false
+  clearPreviewRefreshScheduler()
+  unbindPreviewEvents()
 })
 
 function getImagePreviewContainer() {
@@ -238,7 +828,7 @@ onBeforeRouteLeave(() => {
 <template>
   <a-watermark v-bind="watermark && watermark.enabled ? watermark : {}">
     <!-- 使用伪元素防止首个子元素导致margin塌陷 -->
-    <div class="backface-hidden pos-relative w-full p-2 before:table before:content-['']" :class="`code-theme-${codeTheme} preview-theme-${previewTheme}`">
+    <div ref="previewShellRef" :style="previewShellStyle" class="wj-preview-theme backface-hidden pos-relative w-full p-2 before:table before:content-['']" :class="`code-theme-${codeTheme} preview-theme-${previewTheme}`">
       <div ref="previewRef" class="wj-scrollbar w-full" />
     </div>
   </a-watermark>
